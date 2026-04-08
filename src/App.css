@@ -139,6 +139,11 @@ body {
   background: var(--emerald-dim);
 }
 
+.file-item.drag-over {
+  background: var(--emerald-dim);
+  border: 1px dashed var(--emerald);
+}
+
 .file-icon {
   font-size: 0.62rem;
   flex-shrink: 0;
@@ -149,6 +154,19 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
   flex: 1;
+}
+
+.rename-input {
+  background: transparent;
+  border: 1px solid var(--emerald);
+  color: #fff;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.72rem;
+  padding: 0 4px;
+  border-radius: 3px;
+  flex: 1;
+  width: 100%;
+  outline: none;
 }
 
 .collapsed-badge {
@@ -576,7 +594,7 @@ body {
 /* Phase 4 – list style */
 .sticky-input ul,
 .sticky-input ol {
-  padding-left: 18px;
+  padding-left: 28px;
   color: #888;
 }
 
@@ -858,6 +876,7 @@ body {
   height: 2px;
   display: block;
 }
+
 .tab-bar::-webkit-scrollbar-thumb {
   background: #222;
   border-radius: 4px;
@@ -950,6 +969,7 @@ body {
 .tab-item.active .tab-close {
   color: #555;
 }
+
 .tab-item.active .tab-close:hover {
   color: #e74c3c;
 }
@@ -974,8 +994,15 @@ body {
 }
 
 @keyframes floatIcon {
-  0%, 100% { transform: translateY(0); }
-  50% { transform: translateY(-6px); }
+
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+
+  50% {
+    transform: translateY(-6px);
+  }
 }
 
 .no-page-title {

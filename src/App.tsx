@@ -2,6 +2,7 @@ import React, {
   useState, useEffect, useRef, useCallback,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { MediaMiniPlayer } from "./MediaMiniPlayer";
 import "./App.css";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -72,6 +73,23 @@ const defaultPageData = (): PageData => ({
 
 function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
 
+function getNextName(nodes: FileNode[], prefix: string, extension: string): string {
+  let max = 0;
+  const scan = (children: FileNode[]) => {
+    for (const node of children) {
+      if (node.name.startsWith(prefix)) {
+        const nameWithoutExt = node.is_dir ? node.name : node.name.replace(/\.md$/, "");
+        const numPart = nameWithoutExt.substring(prefix.length).trim();
+        const num = parseInt(numPart, 10);
+        if (!isNaN(num) && num > max) max = num;
+      }
+      if (node.is_dir && node.children) scan(node.children);
+    }
+  };
+  scan(nodes);
+  return `${prefix} ${max + 1}${extension}`;
+}
+
 function getSnapPoint(note: StickyNote, side: string) {
   const h = note.collapsed ? COLLAPSED_H : note.height;
   switch (side) {
@@ -93,95 +111,139 @@ function ctrlOff(side: string, mag = 90) {
   }
 }
 
-// ─── Force-directed layout (no external deps) ────────────────────────────────
-
-interface FNode { id: string; x: number; y: number; vx: number; vy: number; }
-
-function forceLayout(
-  nodes: FNode[],
-  edges: { a: string; b: string }[],
-  W: number, H: number,
-  iters = 140,
-): Record<string, { x: number; y: number }> {
-  const m: Record<string, FNode> = {};
-  nodes.forEach((n) => { m[n.id] = { ...n }; });
-  const ids = Object.keys(m);
-
-  for (let t = 0; t < iters; t++) {
-    const a = 1 - t / iters;
-    for (let i = 0; i < ids.length; i++) {
-      for (let j = i + 1; j < ids.length; j++) {
-        const A = m[ids[i]]; const B = m[ids[j]];
-        const dx = B.x - A.x; const dy = B.y - A.y;
-        const d = Math.max(Math.sqrt(dx * dx + dy * dy), 1);
-        const f = 7000 / (d * d) * a;
-        A.vx -= dx / d * f; A.vy -= dy / d * f;
-        B.vx += dx / d * f; B.vy += dy / d * f;
-      }
-    }
-    edges.forEach(({ a: ai, b: bi }) => {
-      const A = m[ai]; const B = m[bi];
-      if (!A || !B) return;
-      const dx = B.x - A.x; const dy = B.y - A.y;
-      const d = Math.max(Math.sqrt(dx * dx + dy * dy), 1);
-      const f = (d - 110) * 0.04 * a;
-      A.vx += dx / d * f; A.vy += dy / d * f;
-      B.vx -= dx / d * f; B.vy -= dy / d * f;
-    });
-    Object.values(m).forEach((n) => {
-      n.vx += (W / 2 - n.x) * 0.007 * a;
-      n.vy += (H / 2 - n.y) * 0.007 * a;
-    });
-    Object.values(m).forEach((n) => {
-      n.x += n.vx * 0.5; n.y += n.vy * 0.5;
-      n.vx *= 0.82; n.vy *= 0.82;
-      n.x = Math.max(16, Math.min(W - 16, n.x));
-      n.y = Math.max(16, Math.min(H - 16, n.y));
-    });
-  }
-
-  const out: Record<string, { x: number; y: number }> = {};
-  Object.entries(m).forEach(([id, n]) => { out[id] = { x: n.x, y: n.y }; });
-  return out;
+// ─── Types & Definitions for Hierarchical Graph ──────────────────────────────
+export interface GraphNode {
+  id: string;      // Unique path or ID
+  title: string;   // Label text
+  color: string;   // Node color
+  type: "root" | "folder" | "page" | "note";
+  isCenter?: boolean;
 }
 
-// ─── GraphView ────────────────────────────────────────────────────────────────
+export interface GraphEdge {
+  id: string;
+  fromId: string;
+  toId: string;
+  color: string;
+  isTransparentGray?: boolean;
+}
+
+interface FNode { id: string; x: number; y: number; vx: number; vy: number; isCenter?: boolean; }
+
+// ─── GraphView (Live Animated Organic Layout) ─────────────────────────────────
 
 function GraphView({
-  notes, connections, onFocus,
+  nodes, edges, onNodeClick,
 }: {
-  notes: StickyNote[];
-  connections: Connection[];
-  onFocus: (id: string) => void;
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  onNodeClick: (id: string, type: "root" | "folder" | "page" | "note") => void;
 }) {
   const svgRef = useRef<SVGSVGElement>(null);
-  const posRef = useRef<Record<string, { x: number; y: number }>>({});
+  const simNodes = useRef<Record<string, FNode>>({});
   const [pos, setPos] = useState<Record<string, { x: number; y: number }>>({});
   const [gc, setGc] = useState({ x: 0, y: 0, zoom: 1 });
   const [panning, setPanning] = useState(false);
   const [hov, setHov] = useState<string | null>(null);
 
+  // Sync nodes into simulation state
   useEffect(() => {
     const el = svgRef.current;
     if (!el) return;
     const W = el.clientWidth || 500;
     const H = el.clientHeight || 180;
-    const seed: FNode[] = notes.map((n, i) => {
-      const prev = posRef.current[n.id];
-      return prev
-        ? { id: n.id, ...prev, vx: 0, vy: 0 }
-        : {
+
+    nodes.forEach((n) => {
+      if (!simNodes.current[n.id]) {
+        // Spawn them clustered near the center
+        const spawnCenter = Object.values(simNodes.current).find(node => node.isCenter);
+        const startX = spawnCenter ? spawnCenter.x : W / 2;
+        const startY = spawnCenter ? spawnCenter.y : H / 2;
+
+        simNodes.current[n.id] = {
           id: n.id,
-          x: W / 2 + Math.cos((i / Math.max(notes.length, 1)) * Math.PI * 2) * 80,
-          y: H / 2 + Math.sin((i / Math.max(notes.length, 1)) * Math.PI * 2) * 55,
-          vx: 0, vy: 0
+          x: startX + (Math.random() - 0.5) * 60,
+          y: startY + (Math.random() - 0.5) * 60,
+          vx: 0, vy: 0,
+          isCenter: n.isCenter
         };
+      } else {
+        simNodes.current[n.id].isCenter = n.isCenter;
+      }
     });
-    const edges = connections.map((c) => ({ a: c.fromId, b: c.toId }));
-    const result = forceLayout(seed, edges, W, H);
-    posRef.current = result;
-    setPos(result);
-  }, [notes.length, connections.length]);
+
+    const curIds = new Set(nodes.map(n => n.id));
+    for (const key in simNodes.current) {
+      if (!curIds.has(key)) delete simNodes.current[key];
+    }
+  }, [nodes]);
+
+  // Physics animation loop
+  useEffect(() => {
+    let req: number;
+    const tick = () => {
+      const el = svgRef.current;
+      if (!el) return;
+      const W = el.clientWidth || 500;
+      const H = el.clientHeight || 180;
+
+      const m = simNodes.current;
+      const ids = Object.keys(m);
+      // Repulsion
+      for (let i = 0; i < ids.length; i++) {
+        for (let j = i + 1; j < ids.length; j++) {
+          const A = m[ids[i]]; const B = m[ids[j]];
+          const dx = B.x - A.x; const dy = B.y - A.y;
+          const d = Math.max(Math.sqrt(dx * dx + dy * dy), 1);
+          const f = 4000 / (d * d);
+          A.vx -= dx / d * f; A.vy -= dy / d * f;
+          B.vx += dx / d * f; B.vy += dy / d * f;
+        }
+      }
+      // Spring attraction (edges)
+      edges.forEach(e => {
+        const A = m[e.fromId]; const B = m[e.toId];
+        if (!A || !B) return;
+        const dx = B.x - A.x; const dy = B.y - A.y;
+        const d = Math.max(Math.sqrt(dx * dx + dy * dy), 1);
+        const targetD = e.isTransparentGray ? 90 : 120;
+        const f = (d - targetD) * 0.05;
+        A.vx += dx / d * f; A.vy += dy / d * f;
+        B.vx -= dx / d * f; B.vy -= dy / d * f;
+      });
+
+      Object.values(m).forEach(n => {
+        // Organic jitter (subtle floating)
+        n.vx += (Math.random() - 0.5) * 0.3;
+        n.vy += (Math.random() - 0.5) * 0.3;
+
+        // Slight global gravity
+        n.vx += (W / 2 - n.x) * 0.003;
+        n.vy += (H / 2 - n.y) * 0.003;
+
+        // Stronger gravity for central nodes
+        if (n.isCenter) {
+          n.vx += (W / 2 - n.x) * 0.02;
+          n.vy += (H / 2 - n.y) * 0.02;
+        }
+
+        // Limit physics explosion velocities
+        n.x += n.vx; n.y += n.vy;
+        n.vx = Math.max(-12, Math.min(12, n.vx * 0.82));
+        n.vy = Math.max(-12, Math.min(12, n.vy * 0.82));
+        n.x = Math.max(16, Math.min(W - 16, n.x));
+        n.y = Math.max(16, Math.min(H - 16, n.y));
+      });
+
+      const out: Record<string, { x: number, y: number }> = {};
+      ids.forEach(id => { out[id] = { x: m[id].x, y: m[id].y }; });
+      setPos(out);
+
+      req = requestAnimationFrame(tick);
+    };
+    req = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(req);
+  }, [edges]);
 
   const gt = `translate(${gc.x}px,${gc.y}px) scale(${gc.zoom})`;
 
@@ -204,35 +266,49 @@ function GraphView({
     >
       <defs>
         <marker id="garrow" markerWidth="5" markerHeight="4" refX="4" refY="2" orient="auto" markerUnits="strokeWidth">
-          <polygon points="0 0,5 2,0 4" fill="#2ecc71" opacity="0.4" />
+          <polygon points="0 0,5 2,0 4" fill="#666" opacity="0.6" />
         </marker>
       </defs>
       <g style={{ transform: gt, transformOrigin: "0 0" }}>
-        {connections.map((c) => {
+        {edges.map((c) => {
           const f = pos[c.fromId]; const t = pos[c.toId];
           if (!f || !t) return null;
           return <line key={c.id} x1={f.x} y1={f.y} x2={t.x} y2={t.y}
-            stroke={c.color} strokeWidth="1" strokeOpacity="0.3" markerEnd="url(#garrow)" />;
+            stroke={c.color} strokeWidth={c.isTransparentGray ? "1.5" : "1.5"}
+            strokeOpacity={c.isTransparentGray ? "0.2" : "0.5"}
+            markerEnd={c.isTransparentGray ? undefined : "url(#garrow)"} />;
         })}
-        {notes.map((n) => {
+        {nodes.map((n) => {
           const p = pos[n.id]; if (!p) return null;
           const h = hov === n.id;
+
+          let baseR = 10;
+          if (n.isCenter) {
+            baseR = 15;
+          } else if (n.type === "note") {
+            baseR = 7;
+          } else {
+            baseR = 10;
+          }
+
+          const r = h ? baseR * 1.4 : baseR;
+
           return (
             <g key={n.id} style={{ cursor: "pointer" }}
-              onClick={() => onFocus(n.id)}
+              onClick={() => onNodeClick(n.id, n.type)}
               onMouseEnter={() => setHov(n.id)}
               onMouseLeave={() => setHov(null)}
             >
-              {h && <circle cx={p.x} cy={p.y} r="16" fill="none"
+              {h && <circle cx={p.x} cy={p.y} r={r * 1.8} fill="none"
                 stroke={n.color} strokeWidth="0.5" strokeOpacity="0.35" />}
-              <circle cx={p.x} cy={p.y} r={h ? 8 : 5}
-                fill="#0d0d0d" stroke={n.color} strokeWidth={h ? 2 : 1.5}
+              <circle cx={p.x} cy={p.y} r={r}
+                fill="#0d0d0d" stroke={n.color} strokeWidth={h ? 2.5 : 1.8}
                 style={{ transition: "r 0.12s" }} />
-              <text x={p.x} y={p.y + (h ? 20 : 16)} textAnchor="middle"
-                fill={h ? n.color : "#3a3a3a"} fontSize="8"
+              <text x={p.x} y={p.y + Math.max(r + 12, 16)} textAnchor="middle"
+                fill={h ? n.color : "#999"} fontSize={n.type === "root" || n.type === "folder" ? "10" : "8"}
                 fontFamily="'JetBrains Mono',monospace"
                 style={{ transition: "fill 0.12s", pointerEvents: "none" }}>
-                {n.title.slice(0, 20)}
+                {n.title.slice(0, n.isCenter ? 30 : 20)}
               </text>
             </g>
           );
@@ -250,14 +326,30 @@ function FileTree({
   activeTabPath,
   openTabPaths,
   onOpenFile,
+  onOpenFolder,
   parentPath = "",
+  renamingFilePath,
+  onRenameStart,
+  onRenameCommit,
+  onFileContextMenu,
+  draggedPath,
+  setDraggedPath,
+  onItemDrop,
 }: {
   nodes: FileNode[];
   depth?: number;
   activeTabPath: string | null;
   openTabPaths: Set<string>;
   onOpenFile: (path: string, name: string) => void;
+  onOpenFolder?: (path: string) => void;
   parentPath?: string;
+  renamingFilePath?: string | null;
+  onRenameStart?: (path: string) => void;
+  onRenameCommit?: (oldPath: string, newName: string) => void;
+  onFileContextMenu?: (e: React.MouseEvent, path: string, name: string, is_dir: boolean) => void;
+  draggedPath?: string | null;
+  setDraggedPath?: (path: string | null) => void;
+  onItemDrop?: (sourcePath: string, targetDirPath: string) => void;
 }) {
   const [col, setCol] = useState<Record<string, boolean>>({});
 
@@ -267,22 +359,96 @@ function FileTree({
         const fullPath = parentPath ? `${parentPath}/${node.name}` : node.name;
         const isActive = !node.is_dir && activeTabPath === fullPath;
         const isOpen = !node.is_dir && openTabPaths.has(fullPath);
+        const isRenaming = fullPath === renamingFilePath;
 
         return (
           <div key={fullPath}>
             <div
+              draggable={!isRenaming}
+              onDragStart={(e) => {
+                e.stopPropagation();
+                if (setDraggedPath) setDraggedPath(fullPath);
+                e.dataTransfer.setData("text/plain", fullPath);
+                e.dataTransfer.effectAllowed = "move";
+              }}
+              onDragOver={(e) => {
+                if (node.is_dir) {
+                  e.preventDefault();
+                  e.dataTransfer.dropEffect = "move";
+                  e.currentTarget.classList.add("drag-over");
+                }
+              }}
+              onDragLeave={(e) => {
+                if (node.is_dir) {
+                  e.currentTarget.classList.remove("drag-over");
+                }
+              }}
+              onDrop={(e) => {
+                if (node.is_dir) {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  e.currentTarget.classList.remove("drag-over");
+                  if (draggedPath && draggedPath !== fullPath && !draggedPath.startsWith(fullPath + "/")) {
+                    if (onItemDrop) onItemDrop(draggedPath, fullPath);
+                  }
+                  if (setDraggedPath) setDraggedPath(null);
+                }
+              }}
               className={`file-item${node.is_dir ? " folder-item" : ""}${isActive ? " active" : ""}${isOpen && !isActive ? " open-tab" : ""}`}
               style={{ paddingLeft: `${15 + depth * 12}px` }}
-              onClick={() => node.is_dir
-                ? setCol((p) => ({ ...p, [fullPath]: !p[fullPath] }))
-                : onOpenFile(fullPath, node.name)}
+              onClick={() => {
+                if (isRenaming) return;
+                if (node.is_dir) {
+                  setCol((p) => ({ ...p, [fullPath]: !p[fullPath] }));
+                  if (onOpenFolder) onOpenFolder(fullPath);
+                } else {
+                  onOpenFile(fullPath, node.name);
+                }
+              }}
+              onDoubleClick={(e) => {
+                e.stopPropagation();
+                if (onRenameStart && !isRenaming) onRenameStart(fullPath);
+              }}
+              onContextMenu={(e) => {
+                if (onFileContextMenu && !isRenaming) {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  onFileContextMenu(e, fullPath, node.name, node.is_dir);
+                }
+              }}
             >
               <span className="file-icon">
                 {node.is_dir
                   ? (col[fullPath] ? "▶" : "▾")
                   : (isOpen ? "◉" : "◈")}
               </span>
-              <span className="file-name">{node.name.replace(/\.md$/, "")}</span>
+              {isRenaming ? (
+                <input
+                  autoFocus
+                  defaultValue={node.name.replace(/\.md$/, "")}
+                  className="rename-input"
+                  onBlur={(e) => {
+                    let newName = e.target.value.trim();
+                    if (newName && newName !== node.name.replace(/\.md$/, "")) {
+                      if (!node.is_dir && !newName.endsWith(".md")) {
+                        newName += ".md";
+                      }
+                      onRenameCommit?.(fullPath, newName);
+                    } else {
+                      onRenameCommit?.(fullPath, node.name);
+                    }
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.currentTarget.blur();
+                    } else if (e.key === 'Escape') {
+                      onRenameCommit?.(fullPath, node.name);
+                    }
+                  }}
+                />
+              ) : (
+                <span className="file-name">{node.name.replace(/\.md$/, "")}</span>
+              )}
               {isOpen && !isActive && <span className="tab-open-dot" />}
             </div>
             {node.is_dir && !col[fullPath] && node.children && (
@@ -292,7 +458,15 @@ function FileTree({
                 activeTabPath={activeTabPath}
                 openTabPaths={openTabPaths}
                 onOpenFile={onOpenFile}
+                onOpenFolder={onOpenFolder}
                 parentPath={fullPath}
+                renamingFilePath={renamingFilePath}
+                onRenameStart={onRenameStart}
+                onRenameCommit={onRenameCommit}
+                onFileContextMenu={onFileContextMenu}
+                draggedPath={draggedPath}
+                setDraggedPath={setDraggedPath}
+                onItemDrop={onItemDrop}
               />
             )}
           </div>
@@ -376,14 +550,174 @@ export default function App() {
   const [activeColor, setActiveColor] = useState("#2ecc71");
 
   const [menu, setMenu] = useState({ x: 0, y: 0, visible: false, target: "", type: "space" as "space" | "sticky" });
+  const [fileMenu, setFileMenu] = useState({ visible: false, x: 0, y: 0, path: "", name: "", isDir: false });
+  const [renamingFilePath, setRenamingFilePath] = useState<string | null>(null);
+  const [treeDraggedPath, setTreeDraggedPath] = useState<string | null>(null);
+
+  // ── Graph Hierarchy State ──────────────────────────────────────────────────
+  const [graphHistory, setGraphHistory] = useState<string[]>([""]);
+  const [graphHistoryIdx, setGraphHistoryIdx] = useState<number>(0);
+  const currentGraphContext = graphHistory[graphHistoryIdx] ?? "";
 
   const canvasRef = useRef<HTMLDivElement>(null);
   const imgInputRef = useRef<HTMLInputElement>(null);
 
+  const fetchTree = useCallback(async () => {
+    try {
+      const d = await invoke("get_directory_tree");
+      setTree(d as FileNode[]);
+    } catch (err) { console.error(err); }
+  }, []);
+
   // ── Load directory tree ──────────────────────────────────────────────────
   useEffect(() => {
-    invoke("get_directory_tree").then((d) => setTree(d as FileNode[])).catch(console.error);
+    fetchTree();
+  }, [fetchTree]);
+
+  // Sync graph history with active tool context
+  const getChildrenOfPath = useCallback((tNodes: FileNode[], parts: string[]): FileNode[] | null => {
+    if (parts.length === 0 || (parts.length === 1 && parts[0] === "")) return tNodes;
+    const target = tNodes.find(n => n.name === parts[0]);
+    if (!target || !target.is_dir || !target.children) return null;
+    return getChildrenOfPath(target.children, parts.slice(1));
   }, []);
+
+  const buildGraphData = useCallback(() => {
+    let gNodes: GraphNode[] = [];
+    let gEdges: GraphEdge[] = [];
+    const cp = currentGraphContext;
+
+    if (cp === "" || (!cp.endsWith(".md") && !getChildrenOfPath(tree, cp.split('/')))) {
+      gNodes.push({ id: "ROOT", title: vaultName, color: "#2ecc71", isCenter: true, type: "root" }); // Emerald is Green
+      tree.forEach(child => {
+        gNodes.push({ id: child.name, title: child.name.replace(/\.md$/, ""), color: child.is_dir ? "#ffffff" : "#3498db", type: child.is_dir ? "folder" : "page" });
+        gEdges.push({ id: `e-${child.name}`, fromId: "ROOT", toId: child.name, color: "#666", isTransparentGray: true });
+      });
+    } else if (cp.endsWith(".md")) {
+      const safeNotes = cp === activeTabId ? notes : [];
+      const safeConns = cp === activeTabId ? connections : [];
+
+      gNodes.push({ id: cp, title: cp.split("/").pop()!.replace(/\.md$/, ""), color: "#3498db", isCenter: true, type: "page" });
+      safeNotes.forEach(n => {
+        gNodes.push({ id: n.id, title: n.title, color: n.color, type: "note" });
+        gEdges.push({ id: `e-${n.id}`, fromId: cp, toId: n.id, color: "#666", isTransparentGray: true });
+      });
+      safeConns.forEach(c => {
+        gEdges.push({ id: c.id, fromId: c.fromId, toId: c.toId, color: c.color, isTransparentGray: false });
+      });
+    } else {
+      const children = getChildrenOfPath(tree, cp.split('/'));
+      gNodes.push({ id: cp, title: cp.split("/").pop() || cp, color: "#ffffff", isCenter: true, type: "folder" });
+      if (children) {
+        children.forEach(child => {
+          const full = `${cp}/${child.name}`;
+          gNodes.push({ id: full, title: child.name.replace(/\.md$/, ""), color: child.is_dir ? "#ffffff" : "#3498db", type: child.is_dir ? "folder" : "page" });
+          gEdges.push({ id: `e-${full}`, fromId: cp, toId: full, color: "#666", isTransparentGray: true });
+        });
+      }
+    }
+    return { gNodes, gEdges };
+  }, [currentGraphContext, tree, activeTabId, notes, connections, vaultName, getChildrenOfPath]);
+
+  const { gNodes, gEdges } = buildGraphData();
+
+  const handleGraphNodeClick = (id: string, type: string) => {
+    if (type === "note") {
+      focusNote(id);
+    } else if (type === "folder") {
+      if (id !== "ROOT" && id !== currentGraphContext) {
+        setGraphHistory(prev => { const n = prev.slice(0, graphHistoryIdx + 1); n.push(id); return n; });
+        setGraphHistoryIdx(prev => prev + 1);
+      } else if (id === "ROOT") {
+        setGraphHistory(prev => { const n = prev.slice(0, graphHistoryIdx + 1); n.push(""); return n; });
+        setGraphHistoryIdx(prev => prev + 1);
+      }
+    } else if (type === "page") {
+      if (id !== currentGraphContext) {
+        openOrSwitchTab(id, id.split('/').pop() || id);
+        setGraphHistory(prev => { const n = prev.slice(0, graphHistoryIdx + 1); n.push(id); return n; });
+        setGraphHistoryIdx(prev => prev + 1);
+      }
+    }
+  };
+
+  const handleItemDrop = async (sourcePath: string, targetDirPath: string) => {
+    const sourceParts = sourcePath.split("/");
+    const sourceName = sourceParts.pop() || "";
+    const srcDir = sourceParts.length > 0 ? sourceParts.join("/") : "";
+    if (srcDir === targetDirPath) return;
+
+    const newPath = targetDirPath ? `${targetDirPath}/${sourceName}` : sourceName;
+    try {
+      await invoke("rename_item", { oldPath: sourcePath, newPath });
+      await fetchTree();
+
+      if (sourcePath.endsWith(".md")) {
+        setTabs((prev) => prev.map(t => t.path === sourcePath ? { ...t, path: newPath, id: newPath } : t));
+        if (activeTabId === sourcePath) setActiveTabId(newPath);
+      } else {
+        setTabs((prev) => prev.map(t => {
+          if (t.path.startsWith(sourcePath + "/")) {
+            const updatedPath = t.path.replace(sourcePath, newPath);
+            return { ...t, path: updatedPath, id: updatedPath };
+          }
+          return t;
+        }));
+        if (activeTabId?.startsWith(sourcePath + "/")) {
+          setActiveTabId(activeTabId.replace(sourcePath, newPath));
+        }
+      }
+    } catch (err) {
+      console.error("Move failed", err);
+    }
+  };
+
+  const handleRenameCommit = async (oldPath: string, newName: string) => {
+    setRenamingFilePath(null);
+    const oldParts = oldPath.split("/");
+    const oldName = oldParts.pop() || "";
+    if (oldName === newName) return;
+
+    const newPath = oldParts.length > 0 ? `${oldParts.join("/")}/${newName}` : newName;
+    try {
+      await invoke("rename_item", { oldPath, newPath });
+      await fetchTree();
+
+      if (oldPath.endsWith(".md")) {
+        setTabs((prev) => prev.map(t => t.path === oldPath ? { ...t, path: newPath, id: newPath, title: newName.replace(/\.md$/, "") } : t));
+        if (activeTabId === oldPath) setActiveTabId(newPath);
+      } else {
+        setTabs((prev) => prev.map(t => {
+          if (t.path.startsWith(oldPath + "/")) {
+            const updatedPath = t.path.replace(oldPath, newPath);
+            return { ...t, path: updatedPath, id: updatedPath };
+          }
+          return t;
+        }));
+        if (activeTabId?.startsWith(oldPath + "/")) {
+          setActiveTabId(activeTabId.replace(oldPath, newPath));
+        }
+      }
+    } catch (err) {
+      console.error("Rename failed", err);
+    }
+  };
+
+  const handleDeleteItem = async (path: string) => {
+    try {
+      await invoke("delete_item", { path });
+      await fetchTree();
+      setTabs((prev) => {
+        const next = prev.filter((t) => !t.path.startsWith(path) && t.path !== path);
+        if (activeTabId === path || activeTabId?.startsWith(path + "/")) {
+          setActiveTabId(next.length > 0 ? next[0].id : null);
+        }
+        return next;
+      });
+    } catch (err) {
+      console.error("Delete failed", err);
+    }
+  };
 
   // ── Helpers to update the active tab's PageData ───────────────────────────
   const setNotes = useCallback((fn: (n: StickyNote[]) => StickyNote[]) => {
@@ -467,7 +801,7 @@ export default function App() {
 
   // ── Create a new page file ────────────────────────────────────────────────
   const createNewPage = async (folderPath?: string) => {
-    const title = `Note ${uid()}`;
+    const title = getNextName(tree, "Page", "");
     const filename = `${title}.md`;
     const path = folderPath ? `${folderPath}/${filename}` : filename;
     try {
@@ -663,6 +997,7 @@ export default function App() {
       onMouseUp={() => { setPanning(false); setDragging(null); setResizing(null); }}
       onClick={(e) => {
         setMenu((m) => ({ ...m, visible: false }));
+        setFileMenu((m) => ({ ...m, visible: false }));
         setShowCP(false);
         const t = e.target as HTMLElement;
         if (!t.classList.contains("snap-point")) { setDrawFrom(null); setTempEnd(null); }
@@ -681,14 +1016,13 @@ export default function App() {
             + Page
           </button>
           <button className="sidebar-btn" onClick={async () => {
-            const name = `Folder ${uid()}`;
+            const name = getNextName(tree, "Folder", "");
             try {
               await invoke("create_folder", { path: name });
-              const d = await invoke("get_directory_tree");
-              setTree(d as FileNode[]);
+              await fetchTree();
             } catch (err) { console.error(err); }
-          }} title="New folder (divider)">
-            + Divider
+          }} title="New folder">
+            + Folder
           </button>
         </div>
 
@@ -698,7 +1032,28 @@ export default function App() {
               nodes={tree}
               activeTabPath={activeTab?.path ?? null}
               openTabPaths={openTabPaths}
-              onOpenFile={openOrSwitchTab}
+              onOpenFile={(path, name) => {
+                openOrSwitchTab(path, name);
+                if (path !== currentGraphContext) {
+                  setGraphHistory(prev => { const n = prev.slice(0, graphHistoryIdx + 1); n.push(path); return n; });
+                  setGraphHistoryIdx(prev => prev + 1);
+                }
+              }}
+              onOpenFolder={(path) => {
+                if (path !== currentGraphContext) {
+                  setGraphHistory(prev => { const n = prev.slice(0, graphHistoryIdx + 1); n.push(path); return n; });
+                  setGraphHistoryIdx(prev => prev + 1);
+                }
+              }}
+              renamingFilePath={renamingFilePath}
+              onRenameStart={(path) => setRenamingFilePath(path)}
+              onRenameCommit={handleRenameCommit}
+              onFileContextMenu={(e, path, name, isDir) => {
+                setFileMenu({ visible: true, x: e.clientX, y: e.clientY, path, name, isDir });
+              }}
+              draggedPath={treeDraggedPath}
+              setDraggedPath={setTreeDraggedPath}
+              onItemDrop={handleItemDrop}
             />
           )}
           {tree.length === 0 && (
@@ -708,6 +1063,8 @@ export default function App() {
             </div>
           )}
         </div>
+
+        <MediaMiniPlayer />
 
         <div className="resizer-v" onMouseDown={() => {
           const mv = (e: MouseEvent) => setSidebarW(Math.max(50, e.clientX));
@@ -1055,11 +1412,27 @@ export default function App() {
 
             {/* ── GRAPH VIEW ── */}
             <div className="graph-section" style={{ height: graphH }}>
-              <div className="section-header">
-                Graph View — {activeTab.title}
-                <span className="graph-hint">{notes.length} node{notes.length !== 1 ? "s" : ""} · scroll to zoom · drag to pan · click to focus</span>
+              <div className="section-header" style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                <div className="graph-nav" style={{ display: 'flex', gap: '4px' }}>
+                  <button className="tool" onClick={() => setGraphHistoryIdx(p => Math.max(0, p - 1))} disabled={graphHistoryIdx <= 0} title="Back">⬅</button>
+                  <button className="tool" onClick={() => setGraphHistoryIdx(p => Math.min(graphHistory.length - 1, p + 1))} disabled={graphHistoryIdx >= graphHistory.length - 1} title="Forward">➡</button>
+                  <button className="tool" onClick={() => {
+                    setGraphHistory(prev => { const n = prev.slice(0, graphHistoryIdx + 1); n.push(""); return n; });
+                    setGraphHistoryIdx(prev => prev + 1);
+                  }} title="Highest Level">Top Level</button>
+                  <button className="tool" onClick={() => {
+                    if (activeTabId) {
+                      setGraphHistory(prev => { const n = prev.slice(0, graphHistoryIdx + 1); n.push(activeTabId); return n; });
+                      setGraphHistoryIdx(prev => prev + 1);
+                    }
+                  }} disabled={!activeTabId} title="Current Page">Current Page</button>
+                </div>
+                <span>Graph View — {currentGraphContext || vaultName}</span>
+                <span className="graph-hint" style={{ marginLeft: 'auto' }}>
+                  {gNodes.length} node{gNodes.length !== 1 ? "s" : ""} · scroll to zoom · drag to pan · click to navigate
+                </span>
               </div>
-              <GraphView notes={notes} connections={connections} onFocus={focusNote} />
+              <GraphView nodes={gNodes} edges={gEdges} onNodeClick={handleGraphNodeClick} />
             </div>
           </>
         )}
@@ -1090,6 +1463,34 @@ export default function App() {
               <div className="menu-item delete" onClick={() => deleteNote(menu.target)}>✕ Delete Note</div>
             </>
           )}
+        </div>
+      )}
+      {fileMenu.visible && (
+        <div className="context-menu" style={{ top: fileMenu.y, left: fileMenu.x }}>
+          <div className="menu-item" onClick={() => {
+            setFileMenu(m => ({ ...m, visible: false }));
+            setRenamingFilePath(fileMenu.path);
+          }}>✎ Rename</div>
+          {fileMenu.isDir && (
+            <>
+              <div className="menu-item" onClick={async () => {
+                setFileMenu(m => ({ ...m, visible: false }));
+                await createNewPage(fileMenu.path);
+              }}>✦ New Page inside</div>
+              <div className="menu-item" onClick={async () => {
+                setFileMenu(m => ({ ...m, visible: false }));
+                const name = getNextName(tree, "Folder", "");
+                try {
+                  await invoke("create_folder", { path: `${fileMenu.path}/${name}` });
+                  await fetchTree();
+                } catch (err) { console.error(err); }
+              }}>📁 New Folder inside</div>
+            </>
+          )}
+          <div className="menu-item delete" onClick={() => {
+            setFileMenu(m => ({ ...m, visible: false }));
+            handleDeleteItem(fileMenu.path);
+          }}>✕ Delete</div>
         </div>
       )}
     </main>

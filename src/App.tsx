@@ -3,7 +3,6 @@ import React, {
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
-import { app } from "@tauri-apps/api";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -39,6 +38,22 @@ interface FileNode {
   children?: FileNode[];
 }
 
+// ─── Stage 1: PageData & Tab types ───────────────────────────────────────────
+
+interface PageData {
+  notes: StickyNote[];
+  connections: Connection[];
+  camera: { x: number; y: number; zoom: number };
+}
+
+interface Tab {
+  id: string;          // unique tab id (matches file path)
+  path: string;        // relative path like "folder/page.md"
+  title: string;       // display name (filename without .md)
+  data: PageData;
+  isDirty: boolean;
+}
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const NOTE_COLORS = [
@@ -46,6 +61,12 @@ const NOTE_COLORS = [
 ];
 
 const COLLAPSED_H = 40;
+
+const defaultPageData = (): PageData => ({
+  notes: [],
+  connections: [],
+  camera: { x: 0, y: 0, zoom: 1 },
+});
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
 
@@ -88,7 +109,6 @@ function forceLayout(
 
   for (let t = 0; t < iters; t++) {
     const a = 1 - t / iters;
-    // repulsion
     for (let i = 0; i < ids.length; i++) {
       for (let j = i + 1; j < ids.length; j++) {
         const A = m[ids[i]]; const B = m[ids[j]];
@@ -99,7 +119,6 @@ function forceLayout(
         B.vx += dx / d * f; B.vy += dy / d * f;
       }
     }
-    // attraction
     edges.forEach(({ a: ai, b: bi }) => {
       const A = m[ai]; const B = m[bi];
       if (!A || !B) return;
@@ -109,12 +128,10 @@ function forceLayout(
       A.vx += dx / d * f; A.vy += dy / d * f;
       B.vx -= dx / d * f; B.vy -= dy / d * f;
     });
-    // gravity
     Object.values(m).forEach((n) => {
       n.vx += (W / 2 - n.x) * 0.007 * a;
       n.vy += (H / 2 - n.y) * 0.007 * a;
     });
-    // integrate
     Object.values(m).forEach((n) => {
       n.x += n.vx * 0.5; n.y += n.vy * 0.5;
       n.vx *= 0.82; n.vy *= 0.82;
@@ -225,29 +242,97 @@ function GraphView({
   );
 }
 
-// ─── FileTree ─────────────────────────────────────────────────────────────────
+// ─── Stage 2: FileTree (folder-aware, opens tabs, highlights active path) ────
 
-function FileTree({ nodes, depth = 0, activeId, onSelect }: {
-  nodes: FileNode[]; depth?: number; activeId: string | null; onSelect: (n: string) => void;
+function FileTree({
+  nodes,
+  depth = 0,
+  activeTabPath,
+  openTabPaths,
+  onOpenFile,
+  parentPath = "",
+}: {
+  nodes: FileNode[];
+  depth?: number;
+  activeTabPath: string | null;
+  openTabPaths: Set<string>;
+  onOpenFile: (path: string, name: string) => void;
+  parentPath?: string;
 }) {
   const [col, setCol] = useState<Record<string, boolean>>({});
+
   return (
     <div className={depth > 0 ? "indent" : ""}>
-      {nodes.map((node) => (
-        <div key={node.name}>
-          <div
-            className={`file-item ${!node.is_dir && activeId === node.name ? "active" : ""}`}
-            style={{ paddingLeft: `${15 + depth * 12}px` }}
-            onClick={() => node.is_dir
-              ? setCol((p) => ({ ...p, [node.name]: !p[node.name] }))
-              : onSelect(node.name)}
-          >
-            <span className="file-icon">{node.is_dir ? (col[node.name] ? "▶" : "▾") : "◈"}</span>
-            <span className="file-name">{node.name.replace(/\.md$/, "")}</span>
+      {nodes.map((node) => {
+        const fullPath = parentPath ? `${parentPath}/${node.name}` : node.name;
+        const isActive = !node.is_dir && activeTabPath === fullPath;
+        const isOpen = !node.is_dir && openTabPaths.has(fullPath);
+
+        return (
+          <div key={fullPath}>
+            <div
+              className={`file-item${node.is_dir ? " folder-item" : ""}${isActive ? " active" : ""}${isOpen && !isActive ? " open-tab" : ""}`}
+              style={{ paddingLeft: `${15 + depth * 12}px` }}
+              onClick={() => node.is_dir
+                ? setCol((p) => ({ ...p, [fullPath]: !p[fullPath] }))
+                : onOpenFile(fullPath, node.name)}
+            >
+              <span className="file-icon">
+                {node.is_dir
+                  ? (col[fullPath] ? "▶" : "▾")
+                  : (isOpen ? "◉" : "◈")}
+              </span>
+              <span className="file-name">{node.name.replace(/\.md$/, "")}</span>
+              {isOpen && !isActive && <span className="tab-open-dot" />}
+            </div>
+            {node.is_dir && !col[fullPath] && node.children && (
+              <FileTree
+                nodes={node.children}
+                depth={depth + 1}
+                activeTabPath={activeTabPath}
+                openTabPaths={openTabPaths}
+                onOpenFile={onOpenFile}
+                parentPath={fullPath}
+              />
+            )}
           </div>
-          {node.is_dir && !col[node.name] && node.children && (
-            <FileTree nodes={node.children} depth={depth + 1} activeId={activeId} onSelect={onSelect} />
-          )}
+        );
+      })}
+    </div>
+  );
+}
+
+// ─── Stage 3: TabBar ─────────────────────────────────────────────────────────
+
+function TabBar({
+  tabs,
+  activeTabId,
+  onSwitch,
+  onClose,
+}: {
+  tabs: Tab[];
+  activeTabId: string | null;
+  onSwitch: (id: string) => void;
+  onClose: (id: string, e: React.MouseEvent) => void;
+}) {
+  if (tabs.length === 0) return null;
+
+  return (
+    <div className="tab-bar">
+      {tabs.map((tab) => (
+        <div
+          key={tab.id}
+          className={`tab-item${tab.id === activeTabId ? " active" : ""}${tab.isDirty ? " dirty" : ""}`}
+          onClick={() => onSwitch(tab.id)}
+        >
+          <span className="tab-icon">◈</span>
+          <span className="tab-title">{tab.title}</span>
+          {tab.isDirty && <span className="tab-dirty-dot" />}
+          <button
+            className="tab-close"
+            onClick={(e) => onClose(tab.id, e)}
+            title="Close tab"
+          >×</button>
         </div>
       ))}
     </div>
@@ -258,15 +343,18 @@ function FileTree({ nodes, depth = 0, activeId, onSelect }: {
 
 export default function App() {
   const [tree, setTree] = useState<FileNode[]>([]);
-  const [notes, setNotes] = useState<StickyNote[]>([
-    {
-      id: "1", title: "1974 ECOA Act", content: "Lenders must compare based on numbers...",
-      x: 120, y: 80, width: 300, height: 200, color: "#2ecc71", collapsed: false
-    },
-  ]);
-  const [connections, setConns] = useState<Connection[]>([]);
   const [vaultName] = useState("EMERALD");
 
+  // ── Stage 1: Tab state ────────────────────────────────────────────────────
+  const [tabs, setTabs] = useState<Tab[]>([]);
+  const [activeTabId, setActiveTabId] = useState<string | null>(null);
+
+  const activeTab = tabs.find((t) => t.id === activeTabId) ?? null;
+  const notes = activeTab?.data.notes ?? [];
+  const connections = activeTab?.data.connections ?? [];
+  const camera = activeTab?.data.camera ?? { x: 0, y: 0, zoom: 1 };
+
+  // ── Per-canvas UI state (reset when switching tabs) ───────────────────────
   const [activeId, setActiveId] = useState<string | null>(null);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [selConnId, setSelConnId] = useState<string | null>(null);
@@ -276,7 +364,6 @@ export default function App() {
 
   const [sidebarW, setSidebarW] = useState(220);
   const [graphH, setGraphH] = useState(220);
-  const [camera, setCamera] = useState({ x: 0, y: 0, zoom: 1 });
   const [panning, setPanning] = useState(false);
   const [dragging, setDragging] = useState<string | null>(null);
   const [resizing, setResizing] = useState<{ id: string; edge: string } | null>(null);
@@ -284,7 +371,6 @@ export default function App() {
   const [drawFrom, setDrawFrom] = useState<{ id: string; side: string; wx: number; wy: number } | null>(null);
   const [tempEnd, setTempEnd] = useState<{ wx: number; wy: number } | null>(null);
 
-  // Phase 4 toolbar
   const [fmts, setFmts] = useState<string[]>([]);
   const [fontSize, setFontSize] = useState(14);
   const [activeColor, setActiveColor] = useState("#2ecc71");
@@ -294,10 +380,106 @@ export default function App() {
   const canvasRef = useRef<HTMLDivElement>(null);
   const imgInputRef = useRef<HTMLInputElement>(null);
 
-  // ── Load tree ────────────────────────────────────────────────────────────
+  // ── Load directory tree ──────────────────────────────────────────────────
   useEffect(() => {
     invoke("get_directory_tree").then((d) => setTree(d as FileNode[])).catch(console.error);
   }, []);
+
+  // ── Helpers to update the active tab's PageData ───────────────────────────
+  const setNotes = useCallback((fn: (n: StickyNote[]) => StickyNote[]) => {
+    setTabs((prev) => prev.map((t) =>
+      t.id === activeTabId
+        ? { ...t, isDirty: true, data: { ...t.data, notes: fn(t.data.notes) } }
+        : t
+    ));
+  }, [activeTabId]);
+
+  const setConns = useCallback((fn: (c: Connection[]) => Connection[]) => {
+    setTabs((prev) => prev.map((t) =>
+      t.id === activeTabId
+        ? { ...t, isDirty: true, data: { ...t.data, connections: fn(t.data.connections) } }
+        : t
+    ));
+  }, [activeTabId]);
+
+  const setCamera = useCallback((fn: ((c: { x: number; y: number; zoom: number }) => { x: number; y: number; zoom: number }) | { x: number; y: number; zoom: number }) => {
+    setTabs((prev) => prev.map((t) => {
+      if (t.id !== activeTabId) return t;
+      const next = typeof fn === "function" ? fn(t.data.camera) : fn;
+      return { ...t, data: { ...t.data, camera: next } };
+    }));
+  }, [activeTabId]);
+
+  // ── Stage 2: Open / switch tabs ──────────────────────────────────────────
+  const openTabPaths = new Set(tabs.map((t) => t.path));
+
+  const openOrSwitchTab = useCallback((path: string, name: string) => {
+    const existing = tabs.find((t) => t.path === path);
+    if (existing) {
+      setActiveTabId(existing.id);
+    } else {
+      const title = name.replace(/\.md$/, "");
+      const newTab: Tab = {
+        id: path,
+        path,
+        title,
+        data: defaultPageData(),
+        isDirty: false,
+      };
+      setTabs((prev) => [...prev, newTab]);
+      setActiveTabId(path);
+    }
+    // Reset per-canvas UI on tab switch
+    setActiveId(null);
+    setRenamingId(null);
+    setSelConnId(null);
+    setDrawFrom(null);
+    setTempEnd(null);
+    setArrowTool(false);
+    setShowCP(false);
+    setEditLabel(null);
+  }, [tabs]);
+
+  const switchTab = useCallback((id: string) => {
+    setActiveTabId(id);
+    setActiveId(null);
+    setRenamingId(null);
+    setSelConnId(null);
+    setDrawFrom(null);
+    setTempEnd(null);
+    setArrowTool(false);
+    setShowCP(false);
+    setEditLabel(null);
+  }, []);
+
+  const closeTab = useCallback((id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setTabs((prev) => {
+      const idx = prev.findIndex((t) => t.id === id);
+      const next = prev.filter((t) => t.id !== id);
+      if (activeTabId === id) {
+        const sibling = next[Math.min(idx, next.length - 1)];
+        setActiveTabId(sibling?.id ?? null);
+      }
+      return next;
+    });
+  }, [activeTabId]);
+
+  // ── Create a new page file ────────────────────────────────────────────────
+  const createNewPage = async (folderPath?: string) => {
+    const title = `Note ${uid()}`;
+    const filename = `${title}.md`;
+    const path = folderPath ? `${folderPath}/${filename}` : filename;
+    try {
+      await invoke("save_note", { path, content: "" });
+      // Refresh tree
+      const d = await invoke("get_directory_tree");
+      setTree(d as FileNode[]);
+      openOrSwitchTab(path, filename);
+    } catch (err) {
+      console.error(err);
+    }
+  };
 
   // ── Global keys ──────────────────────────────────────────────────────────
   useEffect(() => {
@@ -310,11 +492,12 @@ export default function App() {
     };
     window.addEventListener("keydown", h);
     return () => window.removeEventListener("keydown", h);
-  }, [selConnId, activeId]);
+  }, [selConnId, activeId, setConns]);
 
   // ── Wheel zoom ────────────────────────────────────────────────────────────
   useEffect(() => {
     const h = (e: WheelEvent) => {
+      if (!activeTab) return;
       if (renamingId) return;
       e.preventDefault();
       const rect = canvasRef.current?.getBoundingClientRect(); if (!rect) return;
@@ -326,7 +509,7 @@ export default function App() {
     const el = canvasRef.current;
     el?.addEventListener("wheel", h, { passive: false });
     return () => el?.removeEventListener("wheel", h);
-  }, [camera.zoom, renamingId]);
+  }, [camera.zoom, renamingId, activeTab, setCamera]);
 
   // ── Coords ────────────────────────────────────────────────────────────────
   const s2w = useCallback((sx: number, sy: number) => {
@@ -337,6 +520,7 @@ export default function App() {
 
   // ── Note ops ──────────────────────────────────────────────────────────────
   const createNote = (sx: number, sy: number) => {
+    if (!activeTab) return;
     const { wx, wy } = s2w(sx, sy);
     const id = uid();
     setNotes((p) => [...p, {
@@ -408,7 +592,7 @@ export default function App() {
     return { x: (s.x + e.x) / 2, y: (s.y + e.y) / 2 };
   };
 
-  // ── Format ops (Phase 4) ──────────────────────────────────────────────────
+  // ── Format ops ────────────────────────────────────────────────────────────
   const fmt = (e: React.MouseEvent, cmd: string, val?: string) => {
     e.preventDefault();
     if (cmd === "insertHTML") {
@@ -437,7 +621,7 @@ export default function App() {
     });
   };
 
-  // ── Focus note (from graph or sidebar) ───────────────────────────────────
+  // ── Focus note ────────────────────────────────────────────────────────────
   const focusNote = (id: string) => {
     const note = notes.find((n) => n.id === id); if (!note) return;
     const rect = canvasRef.current?.getBoundingClientRect(); if (!rect) return;
@@ -485,53 +669,42 @@ export default function App() {
       }}
     >
 
-      {/* ════ SIDEBAR ════ */}
+      {/* ════ SIDEBAR (Stage 2 – Binder / Folders / Pages) ════ */}
       <div className="sidebar" style={{ width: sidebarW }}>
-        <div className="sidebar-header"><span className="vault-title">{vaultName}</span></div>
+        <div className="sidebar-header">
+          <span className="vault-title">{vaultName}</span>
+          <span className="vault-subtitle">Binder</span>
+        </div>
 
         <div className="sidebar-actions">
-          <button className="sidebar-btn" onClick={() => {
-            const id = uid();
-            const { wx, wy } = s2w(sidebarW + 60, 80);
-            setNotes((p) => [...p, {
-              id, title: "New Note", content: "", x: wx, y: wy,
-              width: 260, height: 170, color: "#2ecc71", collapsed: false
-            }]);
-            setActiveId(id);
-          }}>+ Note</button>
-          <button className="sidebar-btn">+ Folder</button>
+          <button className="sidebar-btn" onClick={() => createNewPage()} title="New page in root">
+            + Page
+          </button>
+          <button className="sidebar-btn" onClick={async () => {
+            const name = `Folder ${uid()}`;
+            try {
+              await invoke("create_folder", { path: name });
+              const d = await invoke("get_directory_tree");
+              setTree(d as FileNode[]);
+            } catch (err) { console.error(err); }
+          }} title="New folder (divider)">
+            + Divider
+          </button>
         </div>
 
         <div className="file-list">
           {tree.length > 0 && (
-            <FileTree nodes={tree} activeId={activeId} onSelect={(name) => {
-              const m = notes.find((n) => n.title === name.replace(/\.md$/, ""));
-              if (m) focusNote(m.id);
-            }} />
+            <FileTree
+              nodes={tree}
+              activeTabPath={activeTab?.path ?? null}
+              openTabPaths={openTabPaths}
+              onOpenFile={openOrSwitchTab}
+            />
           )}
-          {notes.length > 0 && (
-            <div className="sidebar-section">
-              <div className="sidebar-section-label">Canvas Notes</div>
-              {notes.map((n) => (
-                <div key={n.id}
-                  className={`file-item ${activeId === n.id ? "active" : ""}`}
-                  onClick={() => focusNote(n.id)}
-                  onContextMenu={(e) => {
-                    e.preventDefault();
-                    setMenu({ x: e.clientX, y: e.clientY, visible: true, target: n.id, type: "sticky" });
-                  }}
-                >
-                  <span className="file-icon" style={{ color: n.color }}>◈</span>
-                  <span className="file-name">{n.title}</span>
-                  {n.collapsed && <span className="collapsed-badge">—</span>}
-                </div>
-              ))}
-            </div>
-          )}
-          {notes.length === 0 && tree.length === 0 && (
+          {tree.length === 0 && (
             <div className="empty-vault">
-              <span>No notes yet</span>
-              <small>Right-click canvas to create one</small>
+              <span>Empty binder</span>
+              <small>Click "+ Page" to create your first notebook page</small>
             </div>
           )}
         </div>
@@ -546,352 +719,350 @@ export default function App() {
       {/* ════ WORKSPACE ════ */}
       <div className="workspace">
 
-        {/* ── CANVAS ── */}
-        <div
-          className={`canvas-container ${activeId && !arrowTool ? "panning-locked" : ""}`}
-          ref={canvasRef}
-          onMouseDown={(e) => {
-            if (renamingId) return;
-            if (e.button === 1) { setPanning(true); e.preventDefault(); return; }
-            if (e.button === 0 && e.target === canvasRef.current) {
-              setActiveId(null); setSelConnId(null);
-              if (!drawFrom) setPanning(true);
-            }
-          }}
-          onMouseUp={() => setPanning(false)}
-          onDoubleClick={(e) => {
-            if (e.target === canvasRef.current) {
-              setActiveId(null); setRenamingId(null); setSelConnId(null); setArrowTool(false);
-            }
-          }}
-          onContextMenu={(e) => {
-            e.preventDefault();
-            if (e.target === canvasRef.current)
-              setMenu({ x: e.clientX, y: e.clientY, visible: true, target: "", type: "space" });
-          }}
-        >
+        {/* ── Stage 3: TAB BAR ── */}
+        <TabBar
+          tabs={tabs}
+          activeTabId={activeTabId}
+          onSwitch={switchTab}
+          onClose={closeTab}
+        />
 
-          {/* ══ TOOLBAR ══ */}
-          <div className="canvas-toolbar">
-            {/* Bold / Italic / Underline / Strikethrough / Code */}
-            <div className="toolbar-group">
-              {(["bold", "italic", "underline"] as const).map((cmd, i) => (
-                <button key={cmd} className={`tool ${fmts.includes(cmd) ? "active-toggled" : ""}`}
-                  onMouseDown={(e) => fmt(e, cmd)} title={["Bold", "Italic", "Underline"][i]}>
-                  {["B", "I", "U"][i]}
-                </button>
-              ))}
-              <button className="tool" title="Strikethrough"
-                onMouseDown={(e) => fmt(e, "strikeThrough")}>
-                <s>S</s>
-              </button>
-              <button className="tool code-btn" title="Inline code"
-                onMouseDown={(e) => fmt(e, "insertHTML", "<code class='ic'>\u200B</code>")}>
-                {"<>"}
-              </button>
-            </div>
-
-            <div className="tool-divider" />
-
-            {/* Font size */}
-            <div className="toolbar-group">
-              <button className="tool" onMouseDown={(e) => changeFontSize(e, -1)} title="Smaller">A−</button>
-              <span className="font-sz-display">{fontSize}</span>
-              <button className="tool" onMouseDown={(e) => changeFontSize(e, +1)} title="Larger">A+</button>
-            </div>
-
-            <div className="tool-divider" />
-
-            {/* Lists */}
-            <div className="toolbar-group">
-              <button className="tool" title="Bullet list" onMouseDown={(e) => fmt(e, "insertUnorderedList")}>•≡</button>
-              <button className="tool" title="Numbered list" onMouseDown={(e) => fmt(e, "insertOrderedList")}>1≡</button>
-            </div>
-
-            <div className="tool-divider" />
-
-            {/* Colour swatches */}
-            <div className="toolbar-group">
-              {NOTE_COLORS.map((c) => (
-                <div key={c} className={`swatch ${activeColor === c ? "selected" : ""}`}
-                  style={{ backgroundColor: c }}
-                  onMouseDown={(e) => fmt(e, "foreColor", c)} />
-              ))}
-            </div>
-
-            <div className="tool-divider" />
-
-            {/* Link */}
-            <button className="tool" title="Insert link"
-              onMouseDown={(e) => {
-                e.preventDefault();
-                const url = prompt("Enter URL:");
-                if (url) fmt(e, "createLink", url);
-              }}>🔗</button>
-
-            {/* Image embed */}
-            <button className="tool" title="Embed image"
-              onMouseDown={(e) => { e.preventDefault(); imgInputRef.current?.click(); }}>🖼</button>
-
-            <div className="tool-divider" />
-
-            {/* Reset view */}
-            <button className="tool" title="Reset view (R)"
-              onClick={() => setCamera({ x: 0, y: 0, zoom: 1 })}>⌂</button>
-
-            <div className="tool-divider" />
-
-            {/* Arrow tool */}
-            <button className={`tool ${arrowTool ? "active-toggled" : ""}`} title="Arrow tool"
-              onClick={() => { setArrowTool((v) => !v); setDrawFrom(null); setTempEnd(null); }}>↗</button>
-
-            {arrowTool && (
-              <div className="arrow-submenu">
-                <div className="tool-divider" />
-                <div className="toolbar-group">
-                  <button className="tool" title="Straight / Bezier"
-                    onClick={() => selConnId && setConns((p) => p.map((c) => c.id === selConnId ? { ...c, type: c.type === "straight" ? "bezier" : "straight" } : c))}>⌇</button>
-                  <button className="tool" title="Solid / Dashed"
-                    onClick={() => selConnId && setConns((p) => p.map((c) => c.id === selConnId ? { ...c, style: c.style === "solid" ? "dashed" : "solid" } : c))}>--</button>
-                  <button className="tool" title="Double-headed"
-                    onClick={() => selConnId && setConns((p) => p.map((c) => c.id === selConnId ? { ...c, isDoubleHeaded: !c.isDoubleHeaded } : c))}>↔</button>
-                  <button className="tool" title="Edit label"
-                    onClick={() => selConnId && setEditLabel(selConnId)}>T</button>
-                  <button className="tool delete" title="Delete arrow (Del)"
-                    onClick={() => { selConnId && setConns((p) => p.filter((c) => c.id !== selConnId)); setSelConnId(null); }}>✕</button>
-                </div>
-              </div>
-            )}
-
-            {drawFrom && <div className="drawing-indicator">Click target snap point · ESC cancels</div>}
+        {/* ── No tab open placeholder ── */}
+        {!activeTab ? (
+          <div className="no-page-open">
+            <div className="no-page-icon">◈</div>
+            <div className="no-page-title">No page open</div>
+            <div className="no-page-sub">Select a page from the sidebar or create a new one</div>
           </div>
+        ) : (
+          <>
+            {/* ── CANVAS ── */}
+            <div
+              className={`canvas-container ${activeId && !arrowTool ? "panning-locked" : ""}`}
+              ref={canvasRef}
+              onMouseDown={(e) => {
+                if (renamingId) return;
+                if (e.button === 1) { setPanning(true); e.preventDefault(); return; }
+                if (e.button === 0 && e.target === canvasRef.current) {
+                  setActiveId(null); setSelConnId(null);
+                  if (!drawFrom) setPanning(true);
+                }
+              }}
+              onMouseUp={() => setPanning(false)}
+              onDoubleClick={(e) => {
+                if (e.target === canvasRef.current) {
+                  setActiveId(null); setRenamingId(null); setSelConnId(null); setArrowTool(false);
+                }
+              }}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                if (e.target === canvasRef.current)
+                  setMenu({ x: e.clientX, y: e.clientY, visible: true, target: "", type: "space" });
+              }}
+            >
 
-          {/* Hidden image file input */}
-          <input ref={imgInputRef} type="file" accept="image/*" style={{ display: "none" }}
-            onChange={(e) => {
-              const file = e.target.files?.[0];
-              if (file && activeId) embedImage(activeId, file);
-              e.target.value = "";
-            }} />
-
-          {/* ══ SVG ARROW LAYER ══ */}
-          <svg className="snap-layer" style={{ transform: tf, transformOrigin: "0 0" }}>
-            <defs>
-              <marker id="ah-end" markerWidth="8" markerHeight="6"
-                refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
-                <polygon points="0 0,8 3,0 6" fill="context-stroke" />
-              </marker>
-              <marker id="ah-start" markerWidth="8" markerHeight="6"
-                refX="1" refY="3" orient="auto-start-reverse" markerUnits="strokeWidth">
-                <polygon points="8 0,0 3,8 6" fill="context-stroke" />
-              </marker>
-            </defs>
-
-            {connections.map((conn) => {
-              const d = buildPath(conn); const mid = midpoint(conn);
-              if (!d) return null;
-              const sel = selConnId === conn.id;
-              return (
-                <g key={conn.id}>
-                  {/* Fat invisible hit target */}
-                  <path d={d} stroke="transparent" strokeWidth="14" fill="none"
-                    style={{ pointerEvents: "auto", cursor: "pointer" }}
-                    onClick={(e) => { e.stopPropagation(); setSelConnId(conn.id); setArrowTool(true); }} />
-                  {/* Visible arrow */}
-                  <path d={d}
-                    stroke={sel ? "#fff" : conn.color} strokeWidth={sel ? 3 : 2} fill="none"
-                    strokeDasharray={conn.style === "dashed" ? "6,4" : undefined}
-                    markerEnd="url(#ah-end)"
-                    markerStart={conn.isDoubleHeaded ? "url(#ah-start)" : undefined}
-                    className={`connection-path${sel ? " selected" : ""}`}
-                    style={{ pointerEvents: "none" }}
-                  />
-                  {/* Edge label */}
-                  {mid && conn.label && !editLabel && (
-                    <g>
-                      <rect x={mid.x - conn.label.length * 3 - 4} y={mid.y - 13}
-                        width={conn.label.length * 6 + 8} height={16} rx="3"
-                        fill="#0d0d0d" stroke={conn.color} strokeWidth="0.5" strokeOpacity="0.5" />
-                      <text x={mid.x} y={mid.y - 2} textAnchor="middle"
-                        fill={conn.color} fontSize="9" fontFamily="'JetBrains Mono',monospace"
-                        style={{ pointerEvents: "none" }}>
-                        {conn.label}
-                      </text>
-                    </g>
-                  )}
-                  {/* Inline label editor */}
-                  {mid && editLabel === conn.id && (
-                    <foreignObject x={mid.x - 55} y={mid.y - 16} width="110" height="26">
-                      <input autoFocus
-                        style={{
-                          width: "100%", background: "#111", border: `1px solid ${conn.color}`,
-                          color: conn.color, fontSize: "10px", fontFamily: "'JetBrains Mono',monospace",
-                          outline: "none", padding: "3px 5px", borderRadius: "3px"
-                        }}
-                        defaultValue={conn.label || ""}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") {
-                            setConns((p) => p.map((c) => c.id === conn.id ? { ...c, label: (e.target as HTMLInputElement).value } : c));
-                            setEditLabel(null);
-                          }
-                          if (e.key === "Escape") setEditLabel(null);
-                        }}
-                        onBlur={(e) => {
-                          setConns((p) => p.map((c) => c.id === conn.id ? { ...c, label: e.target.value } : c));
-                          setEditLabel(null);
-                        }}
-                        onClick={(e) => e.stopPropagation()}
-                      />
-                    </foreignObject>
-                  )}
-                </g>
-              );
-            })}
-
-            {/* Temp preview */}
-            {drawFrom && tempEnd && (
-              <line x1={drawFrom.wx} y1={drawFrom.wy} x2={tempEnd.wx} y2={tempEnd.wy}
-                stroke={activeColor} strokeWidth="1.5" strokeDasharray="5,4" opacity="0.65" />
-            )}
-          </svg>
-
-          {/* ══ NOTES ══ */}
-          <div className="canvas-content" style={{ transform: tf, transformOrigin: "0 0" }}>
-            {notes.map((note) => {
-              const isAct = activeId === note.id;
-              const isRen = renamingId === note.id;
-              const dispH = note.collapsed ? COLLAPSED_H : note.height;
-
-              return (
-                <div key={note.id}
-                  className={`sticky-note ${isAct ? "active" : ""} ${isRen ? "renaming" : ""} ${note.collapsed ? "collapsed" : ""}`}
-                  style={{
-                    left: note.x, top: note.y, width: note.width, height: dispH,
-                    "--nc": note.color
-                  } as React.CSSProperties}
-                >
-                  {/* Snap points */}
-                  {arrowTool && (["top", "bottom", "left", "right"] as const).map((side) => (
-                    <div key={side}
-                      className={`snap-point ${side}${drawFrom?.id === note.id && drawFrom?.side === side ? " node-selected" : ""}`}
-                      onClick={(e) => handleSnap(note.id, side, e)} />
+              {/* ══ TOOLBAR ══ */}
+              <div className="canvas-toolbar">
+                <div className="toolbar-group">
+                  {(["bold", "italic", "underline"] as const).map((cmd, i) => (
+                    <button key={cmd} className={`tool ${fmts.includes(cmd) ? "active-toggled" : ""}`}
+                      onMouseDown={(e) => fmt(e, cmd)} title={["Bold", "Italic", "Underline"][i]}>
+                      {["B", "I", "U"][i]}
+                    </button>
                   ))}
-
-                  {/* Folded corner */}
-                  <div className="sticky-top-shade" />
-
-                  {/* Collapse button */}
-                  <button className="collapse-btn"
-                    onMouseDown={(e) => e.stopPropagation()}
-                    onClick={(e) => { e.stopPropagation(); toggleCollapse(note.id); }}
-                    title={note.collapsed ? "Expand note" : "Collapse note"}>
-                    {note.collapsed ? "+" : "−"}
+                  <button className="tool" title="Strikethrough"
+                    onMouseDown={(e) => fmt(e, "strikeThrough")}>
+                    <s>S</s>
                   </button>
+                  <button className="tool code-btn" title="Inline code"
+                    onMouseDown={(e) => fmt(e, "insertHTML", "<code class='ic'>\u200B</code>")}>
+                    {"<>"}
+                  </button>
+                </div>
 
-                  {/* Resize handles (only expanded) */}
-                  {!note.collapsed && (
-                    <>
-                      {(["top", "bottom", "left", "right"] as const).map((edge) => (
-                        <div key={edge} className={`resizer-edge ${edge}`}
-                          onMouseDown={(e) => { e.stopPropagation(); setResizing({ id: note.id, edge }); }} />
-                      ))}
-                      <div className="sticky-resize-handle"
-                        onMouseDown={(e) => { e.stopPropagation(); setResizing({ id: note.id, edge: "bottom-right" }); }} />
-                    </>
-                  )}
+                <div className="tool-divider" />
 
-                  {/* Header */}
-                  <div className="sticky-header-label"
-                    onMouseDown={(e) => {
-                      if (isRen || arrowTool) return;
-                      e.stopPropagation();
-                      setDragging(note.id); setActiveId(note.id);
-                    }}
-                    onDoubleClick={(e) => { e.stopPropagation(); setRenamingId(note.id); }}
-                    onContextMenu={(e) => {
-                      e.preventDefault(); e.stopPropagation();
-                      setMenu({ x: e.clientX, y: e.clientY, visible: true, target: note.id, type: "sticky" });
-                    }}
-                  >
-                    {isRen ? (
-                      <input autoFocus className="sticky-title-input" defaultValue={note.title}
-                        onMouseDown={(e) => e.stopPropagation()}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") finalizeRename(note.id, e.currentTarget.value);
-                          if (e.key === "Escape") setRenamingId(null);
-                        }}
-                        onBlur={(e) => finalizeRename(note.id, e.currentTarget.value)}
-                      />
-                    ) : <span>{note.title}</span>}
+                <div className="toolbar-group">
+                  <button className="tool" onMouseDown={(e) => changeFontSize(e, -1)} title="Smaller">A−</button>
+                  <span className="font-sz-display">{fontSize}</span>
+                  <button className="tool" onMouseDown={(e) => changeFontSize(e, +1)} title="Larger">A+</button>
+                </div>
 
-                    {/* Colour dot (Phase 2) */}
-                    {isAct && !isRen && (
-                      <div className="note-color-dot"
-                        style={{ background: note.color }}
-                        onClick={(e) => { e.stopPropagation(); setShowCP((v) => !v); }} />
-                    )}
-                  </div>
+                <div className="tool-divider" />
 
-                  {/* Note colour picker (Phase 2) */}
-                  {isAct && showColorPicker && (
-                    <div className="note-color-picker" onClick={(e) => e.stopPropagation()}>
-                      {NOTE_COLORS.map((c) => (
-                        <div key={c} className="nc-swatch" style={{
-                          background: c,
-                          boxShadow: note.color === c ? `0 0 0 2px #0d0d0d, 0 0 0 3px ${c}` : "none"
-                        }}
-                          onClick={() => { patchNote(note.id, { color: c }); setShowCP(false); }} />
-                      ))}
+                <div className="toolbar-group">
+                  <button className="tool" title="Bullet list" onMouseDown={(e) => fmt(e, "insertUnorderedList")}>•≡</button>
+                  <button className="tool" title="Numbered list" onMouseDown={(e) => fmt(e, "insertOrderedList")}>1≡</button>
+                </div>
+
+                <div className="tool-divider" />
+
+                <div className="toolbar-group">
+                  {NOTE_COLORS.map((c) => (
+                    <div key={c} className={`swatch ${activeColor === c ? "selected" : ""}`}
+                      style={{ backgroundColor: c }}
+                      onMouseDown={(e) => fmt(e, "foreColor", c)} />
+                  ))}
+                </div>
+
+                <div className="tool-divider" />
+
+                <button className="tool" title="Insert link"
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    const url = prompt("Enter URL:");
+                    if (url) fmt(e, "createLink", url);
+                  }}>🔗</button>
+
+                <button className="tool" title="Embed image"
+                  onMouseDown={(e) => { e.preventDefault(); imgInputRef.current?.click(); }}>🖼</button>
+
+                <div className="tool-divider" />
+
+                <button className="tool" title="Reset view"
+                  onClick={() => setCamera({ x: 0, y: 0, zoom: 1 })}>⌂</button>
+
+                <div className="tool-divider" />
+
+                <button className={`tool ${arrowTool ? "active-toggled" : ""}`} title="Arrow tool"
+                  onClick={() => { setArrowTool((v) => !v); setDrawFrom(null); setTempEnd(null); }}>↗</button>
+
+                {arrowTool && (
+                  <div className="arrow-submenu">
+                    <div className="tool-divider" />
+                    <div className="toolbar-group">
+                      <button className="tool" title="Straight / Bezier"
+                        onClick={() => selConnId && setConns((p) => p.map((c) => c.id === selConnId ? { ...c, type: c.type === "straight" ? "bezier" : "straight" } : c))}>⌇</button>
+                      <button className="tool" title="Solid / Dashed"
+                        onClick={() => selConnId && setConns((p) => p.map((c) => c.id === selConnId ? { ...c, style: c.style === "solid" ? "dashed" : "solid" } : c))}>--</button>
+                      <button className="tool" title="Double-headed"
+                        onClick={() => selConnId && setConns((p) => p.map((c) => c.id === selConnId ? { ...c, isDoubleHeaded: !c.isDoubleHeaded } : c))}>↔</button>
+                      <button className="tool" title="Edit label"
+                        onClick={() => selConnId && setEditLabel(selConnId)}>T</button>
+                      <button className="tool delete" title="Delete arrow (Del)"
+                        onClick={() => { selConnId && setConns((p) => p.filter((c) => c.id !== selConnId)); setSelConnId(null); }}>✕</button>
                     </div>
-                  )}
+                  </div>
+                )}
 
-                  {/* Body (hidden when collapsed) */}
-                  {!note.collapsed && (
-                    <>
-                      {note.imageUrl && (
-                        <div className="note-img-wrap">
-                          <img src={note.imageUrl} alt="" className="note-img" />
-                          <button className="note-img-rm"
-                            onClick={(e) => { e.stopPropagation(); patchNote(note.id, { imageUrl: undefined }); }}>✕</button>
+                {drawFrom && <div className="drawing-indicator">Click target snap point · ESC cancels</div>}
+              </div>
+
+              {/* Hidden image file input */}
+              <input ref={imgInputRef} type="file" accept="image/*" style={{ display: "none" }}
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (file && activeId) embedImage(activeId, file);
+                  e.target.value = "";
+                }} />
+
+              {/* ══ SVG ARROW LAYER ══ */}
+              <svg className="snap-layer" style={{ transform: tf, transformOrigin: "0 0" }}>
+                <defs>
+                  <marker id="ah-end" markerWidth="8" markerHeight="6"
+                    refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+                    <polygon points="0 0,8 3,0 6" fill="context-stroke" />
+                  </marker>
+                  <marker id="ah-start" markerWidth="8" markerHeight="6"
+                    refX="1" refY="3" orient="auto-start-reverse" markerUnits="strokeWidth">
+                    <polygon points="8 0,0 3,8 6" fill="context-stroke" />
+                  </marker>
+                </defs>
+
+                {connections.map((conn) => {
+                  const d = buildPath(conn); const mid = midpoint(conn);
+                  if (!d) return null;
+                  const sel = selConnId === conn.id;
+                  return (
+                    <g key={conn.id}>
+                      <path d={d} stroke="transparent" strokeWidth="14" fill="none"
+                        style={{ pointerEvents: "auto", cursor: "pointer" }}
+                        onClick={(e) => { e.stopPropagation(); setSelConnId(conn.id); setArrowTool(true); }} />
+                      <path d={d}
+                        stroke={sel ? "#fff" : conn.color} strokeWidth={sel ? 3 : 2} fill="none"
+                        strokeDasharray={conn.style === "dashed" ? "6,4" : undefined}
+                        markerEnd="url(#ah-end)"
+                        markerStart={conn.isDoubleHeaded ? "url(#ah-start)" : undefined}
+                        className={`connection-path${sel ? " selected" : ""}`}
+                        style={{ pointerEvents: "none" }}
+                      />
+                      {mid && conn.label && !editLabel && (
+                        <g>
+                          <rect x={mid.x - conn.label.length * 3 - 4} y={mid.y - 13}
+                            width={conn.label.length * 6 + 8} height={16} rx="3"
+                            fill="#0d0d0d" stroke={conn.color} strokeWidth="0.5" strokeOpacity="0.5" />
+                          <text x={mid.x} y={mid.y - 2} textAnchor="middle"
+                            fill={conn.color} fontSize="9" fontFamily="'JetBrains Mono',monospace"
+                            style={{ pointerEvents: "none" }}>
+                            {conn.label}
+                          </text>
+                        </g>
+                      )}
+                      {mid && editLabel === conn.id && (
+                        <foreignObject x={mid.x - 55} y={mid.y - 16} width="110" height="26">
+                          <input autoFocus
+                            style={{
+                              width: "100%", background: "#111", border: `1px solid ${conn.color}`,
+                              color: conn.color, fontSize: "10px", fontFamily: "'JetBrains Mono',monospace",
+                              outline: "none", padding: "3px 5px", borderRadius: "3px"
+                            }}
+                            defaultValue={conn.label || ""}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") {
+                                setConns((p) => p.map((c) => c.id === conn.id ? { ...c, label: (e.target as HTMLInputElement).value } : c));
+                                setEditLabel(null);
+                              }
+                              if (e.key === "Escape") setEditLabel(null);
+                            }}
+                            onBlur={(e) => {
+                              setConns((p) => p.map((c) => c.id === conn.id ? { ...c, label: e.target.value } : c));
+                              setEditLabel(null);
+                            }}
+                            onClick={(e) => e.stopPropagation()}
+                          />
+                        </foreignObject>
+                      )}
+                    </g>
+                  );
+                })}
+
+                {drawFrom && tempEnd && (
+                  <line x1={drawFrom.wx} y1={drawFrom.wy} x2={tempEnd.wx} y2={tempEnd.wy}
+                    stroke={activeColor} strokeWidth="1.5" strokeDasharray="5,4" opacity="0.65" />
+                )}
+              </svg>
+
+              {/* ══ NOTES ══ */}
+              <div className="canvas-content" style={{ transform: tf, transformOrigin: "0 0" }}>
+                {notes.map((note) => {
+                  const isAct = activeId === note.id;
+                  const isRen = renamingId === note.id;
+                  const dispH = note.collapsed ? COLLAPSED_H : note.height;
+
+                  return (
+                    <div key={note.id}
+                      className={`sticky-note ${isAct ? "active" : ""} ${isRen ? "renaming" : ""} ${note.collapsed ? "collapsed" : ""}`}
+                      style={{
+                        left: note.x, top: note.y, width: note.width, height: dispH,
+                        "--nc": note.color
+                      } as React.CSSProperties}
+                    >
+                      {arrowTool && (["top", "bottom", "left", "right"] as const).map((side) => (
+                        <div key={side}
+                          className={`snap-point ${side}${drawFrom?.id === note.id && drawFrom?.side === side ? " node-selected" : ""}`}
+                          onClick={(e) => handleSnap(note.id, side, e)} />
+                      ))}
+
+                      <div className="sticky-top-shade" />
+
+                      <button className="collapse-btn"
+                        onMouseDown={(e) => e.stopPropagation()}
+                        onClick={(e) => { e.stopPropagation(); toggleCollapse(note.id); }}
+                        title={note.collapsed ? "Expand note" : "Collapse note"}>
+                        {note.collapsed ? "+" : "−"}
+                      </button>
+
+                      {!note.collapsed && (
+                        <>
+                          {(["top", "bottom", "left", "right"] as const).map((edge) => (
+                            <div key={edge} className={`resizer-edge ${edge}`}
+                              onMouseDown={(e) => { e.stopPropagation(); setResizing({ id: note.id, edge }); }} />
+                          ))}
+                          <div className="sticky-resize-handle"
+                            onMouseDown={(e) => { e.stopPropagation(); setResizing({ id: note.id, edge: "bottom-right" }); }} />
+                        </>
+                      )}
+
+                      <div className="sticky-header-label"
+                        onMouseDown={(e) => {
+                          if (isRen || arrowTool) return;
+                          e.stopPropagation();
+                          setDragging(note.id); setActiveId(note.id);
+                        }}
+                        onDoubleClick={(e) => { e.stopPropagation(); setRenamingId(note.id); }}
+                        onContextMenu={(e) => {
+                          e.preventDefault(); e.stopPropagation();
+                          setMenu({ x: e.clientX, y: e.clientY, visible: true, target: note.id, type: "sticky" });
+                        }}
+                      >
+                        {isRen ? (
+                          <input autoFocus className="sticky-title-input" defaultValue={note.title}
+                            onMouseDown={(e) => e.stopPropagation()}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") finalizeRename(note.id, e.currentTarget.value);
+                              if (e.key === "Escape") setRenamingId(null);
+                            }}
+                            onBlur={(e) => finalizeRename(note.id, e.currentTarget.value)}
+                          />
+                        ) : <span>{note.title}</span>}
+
+                        {isAct && !isRen && (
+                          <div className="note-color-dot"
+                            style={{ background: note.color }}
+                            onClick={(e) => { e.stopPropagation(); setShowCP((v) => !v); }} />
+                        )}
+                      </div>
+
+                      {isAct && showColorPicker && (
+                        <div className="note-color-picker" onClick={(e) => e.stopPropagation()}>
+                          {NOTE_COLORS.map((c) => (
+                            <div key={c} className="nc-swatch" style={{
+                              background: c,
+                              boxShadow: note.color === c ? `0 0 0 2px #0d0d0d, 0 0 0 3px ${c}` : "none"
+                            }}
+                              onClick={() => { patchNote(note.id, { color: c }); setShowCP(false); }} />
+                          ))}
                         </div>
                       )}
-                      <div className="sticky-input"
-                        contentEditable={isAct && !isRen && !arrowTool}
-                        suppressContentEditableWarning
-                        onMouseDown={(e) => { if (arrowTool) return; e.stopPropagation(); setActiveId(note.id); }}
-                        ref={(el) => {
-                          if (el && el.innerHTML !== note.content && activeId !== note.id)
-                            el.innerHTML = note.content;
-                        }}
-                        onInput={(e) => { note.content = (e.target as HTMLElement).innerHTML; }}
-                        onBlur={(e) => {
-                          const html = (e.target as HTMLElement).innerHTML;
-                          setNotes((p) => p.map((n) => n.id === note.id ? { ...n, content: html } : n));
-                        }}
-                      />
-                    </>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        </div>
 
-        {/* ── Graph resizer ── */}
-        <div className="resizer-h" onMouseDown={() => {
-          const mv = (e: MouseEvent) => setGraphH(Math.max(30, Math.min(window.innerHeight - e.clientY, 500)));
-          const up = () => { document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up); };
-          document.addEventListener("mousemove", mv); document.addEventListener("mouseup", up);
-        }} />
+                      {!note.collapsed && (
+                        <>
+                          {note.imageUrl && (
+                            <div className="note-img-wrap">
+                              <img src={note.imageUrl} alt="" className="note-img" />
+                              <button className="note-img-rm"
+                                onClick={(e) => { e.stopPropagation(); patchNote(note.id, { imageUrl: undefined }); }}>✕</button>
+                            </div>
+                          )}
+                          <div className="sticky-input"
+                            contentEditable={isAct && !isRen && !arrowTool}
+                            suppressContentEditableWarning
+                            onMouseDown={(e) => { if (arrowTool) return; e.stopPropagation(); setActiveId(note.id); }}
+                            ref={(el) => {
+                              if (el && el.innerHTML !== note.content && activeId !== note.id)
+                                el.innerHTML = note.content;
+                            }}
+                            onInput={(e) => { note.content = (e.target as HTMLElement).innerHTML; }}
+                            onBlur={(e) => {
+                              const html = (e.target as HTMLElement).innerHTML;
+                              setNotes((p) => p.map((n) => n.id === note.id ? { ...n, content: html } : n));
+                            }}
+                          />
+                        </>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
 
-        {/* ── GRAPH VIEW ── */}
-        <div className="graph-section" style={{ height: graphH }}>
-          <div className="section-header">
-            Graph View
-            <span className="graph-hint">{notes.length} node{notes.length !== 1 ? "s" : ""} · scroll to zoom · drag to pan · click to focus</span>
-          </div>
-          <GraphView notes={notes} connections={connections} onFocus={focusNote} />
-        </div>
+            {/* ── Graph resizer ── */}
+            <div className="resizer-h" onMouseDown={() => {
+              const mv = (e: MouseEvent) => setGraphH(Math.max(30, Math.min(window.innerHeight - e.clientY, 500)));
+              const up = () => { document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up); };
+              document.addEventListener("mousemove", mv); document.addEventListener("mouseup", up);
+            }} />
+
+            {/* ── GRAPH VIEW ── */}
+            <div className="graph-section" style={{ height: graphH }}>
+              <div className="section-header">
+                Graph View — {activeTab.title}
+                <span className="graph-hint">{notes.length} node{notes.length !== 1 ? "s" : ""} · scroll to zoom · drag to pan · click to focus</span>
+              </div>
+              <GraphView notes={notes} connections={connections} onFocus={focusNote} />
+            </div>
+          </>
+        )}
       </div>
 
       {/* ════ CONTEXT MENU ════ */}

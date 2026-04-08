@@ -1,6 +1,6 @@
+use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::{Path};
-use serde::{Serialize, Deserialize};
+use std::path::Path;
 
 #[derive(Serialize, Deserialize)]
 struct FileNode {
@@ -33,7 +33,11 @@ fn scan_dir(path: &Path) -> Result<Vec<FileNode>, String> {
                     children: Some(scan_dir(&entry.path())?),
                 });
             } else if name.ends_with(".md") {
-                nodes.push(FileNode { name, is_dir: false, children: None });
+                nodes.push(FileNode {
+                    name,
+                    is_dir: false,
+                    children: None,
+                });
             }
         }
     }
@@ -83,7 +87,12 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
-            save_note, read_note, get_directory_tree, create_folder, delete_item, rename_item
+            save_note,
+            read_note,
+            get_directory_tree,
+            create_folder,
+            delete_item,
+            rename_item
         ])
         .run(tauri::generate_context!())
         .expect("error");

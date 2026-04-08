@@ -1,10 +1,20 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, {
+  useState, useEffect, useRef, useCallback,
+} from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 
 interface StickyNote {
-  id: string; title: string; content: string;
-  x: number; y: number; width: number; height: number;
+  id: string;
+  title: string;
+  content: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  color: string;
+  collapsed: boolean;
+  imageUrl?: string;
 }
 
 interface Connection {

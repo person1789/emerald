@@ -70,6 +70,7 @@ body {
 
 .sidebar-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 5px;
   padding: 9px 10px;
   border-bottom: 1px solid var(--border);
@@ -77,7 +78,7 @@ body {
 }
 
 .sidebar-btn {
-  flex: 1;
+  flex: 1 1 calc(50% - 3px);
   background: transparent;
   border: 1px solid var(--border-hi);
   color: var(--text-muted);

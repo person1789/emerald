@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::Path;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use tempfile::tempdir;
+use walkdir::WalkDir;
+use zip::write::FileOptions;
+use zip::{ZipArchive, ZipWriter};
 
 #[derive(Serialize, Deserialize)]
 struct FileNode {
@@ -9,13 +14,105 @@ struct FileNode {
     children: Option<Vec<FileNode>>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct StickyNote {
+    id: String,
+    title: String,
+    content: String,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    color: String,
+    collapsed: bool,
+    image_url: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct Connection {
+    id: String,
+    from_id: String,
+    from_side: String,
+    to_id: String,
+    to_side: String,
+    r#type: String,
+    style: String,
+    is_double_headed: bool,
+    color: String,
+    label: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct CameraState {
+    x: f64,
+    y: f64,
+    zoom: f64,
+}
+
+impl Default for CameraState {
+    fn default() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            zoom: 1.0,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct PageCanvasData {
+    version: u32,
+    notes: Vec<StickyNote>,
+    connections: Vec<Connection>,
+    camera: CameraState,
+}
+
+impl Default for PageCanvasData {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            notes: Vec::new(),
+            connections: Vec::new(),
+            camera: CameraState::default(),
+        }
+    }
+}
+
+fn vault_root() -> PathBuf {
+    PathBuf::from("../emerald_notes")
+}
+
+fn ensure_vault_root() -> Result<PathBuf, String> {
+    let root = vault_root();
+    if !root.exists() {
+        fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+    }
+    Ok(root)
+}
+
+fn page_path(path: &str) -> PathBuf {
+    vault_root().join(path)
+}
+
+fn sidecar_path_for(page_file: &Path) -> Result<PathBuf, String> {
+    let stem = page_file
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| "Invalid page file name".to_string())?;
+    Ok(page_file.with_file_name(format!("{stem}.emerald.json")))
+}
+
+fn page_sidecar_path(path: &str) -> Result<PathBuf, String> {
+    sidecar_path_for(&page_path(path))
+}
+
 #[tauri::command]
 fn get_directory_tree() -> Result<Vec<FileNode>, String> {
-    let root_path = "../emerald_notes";
-    if !Path::new(root_path).exists() {
-        fs::create_dir(root_path).map_err(|e| e.to_string())?;
-    }
-    scan_dir(Path::new(root_path))
+    let root = ensure_vault_root()?;
+    scan_dir(&root)
 }
 
 fn scan_dir(path: &Path) -> Result<Vec<FileNode>, String> {
@@ -46,40 +143,214 @@ fn scan_dir(path: &Path) -> Result<Vec<FileNode>, String> {
 
 #[tauri::command]
 fn save_note(path: String, content: String) -> Result<(), String> {
-    let full_path = Path::new("../emerald_notes").join(path);
+    let full_path = page_path(&path);
+    if let Some(parent) = full_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
     fs::write(full_path, content).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
 fn read_note(path: String) -> Result<String, String> {
-    let full_path = Path::new("../emerald_notes").join(path);
+    let full_path = page_path(&path);
     fs::read_to_string(full_path).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
+fn read_page_state(path: String) -> Result<PageCanvasData, String> {
+    let full_path = page_sidecar_path(&path)?;
+    if !full_path.exists() {
+        return Ok(PageCanvasData::default());
+    }
+
+    let raw = fs::read_to_string(&full_path).map_err(|err| err.to_string())?;
+    serde_json::from_str::<PageCanvasData>(&raw).map_err(|err| {
+        format!(
+            "Failed to parse page state for {}: {}",
+            full_path.display(),
+            err
+        )
+    })
+}
+
+#[tauri::command]
+fn save_page_state(path: String, data: PageCanvasData) -> Result<(), String> {
+    let full_path = page_sidecar_path(&path)?;
+    if let Some(parent) = full_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let serialized = serde_json::to_string_pretty(&data).map_err(|err| err.to_string())?;
+    fs::write(full_path, serialized).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
 fn create_folder(path: String) -> Result<(), String> {
-    let full_path = Path::new("../emerald_notes").join(path);
+    let full_path = vault_root().join(path);
     fs::create_dir_all(full_path).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn delete_item(path: String) -> Result<(), String> {
-    let full_path = Path::new("../emerald_notes").join(path);
+    let full_path = vault_root().join(&path);
     if full_path.is_dir() {
         fs::remove_dir_all(full_path).map_err(|e| e.to_string())
     } else {
-        fs::remove_file(full_path).map_err(|e| e.to_string())
+        if full_path.exists() {
+            fs::remove_file(&full_path).map_err(|e| e.to_string())?;
+        }
+        if path.ends_with(".md") {
+            let sidecar = page_sidecar_path(&path)?;
+            if sidecar.exists() {
+                fs::remove_file(sidecar).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
     }
 }
 
 #[tauri::command]
 fn rename_item(old_path: String, new_path: String) -> Result<(), String> {
-    let old = Path::new("../emerald_notes").join(&old_path);
-    let new = Path::new("../emerald_notes").join(&new_path);
+    let old = vault_root().join(&old_path);
+    let new = vault_root().join(&new_path);
     if let Some(parent) = new.parent() {
         fs::create_dir_all(parent).ok();
     }
-    fs::rename(old, new).map_err(|e| e.to_string())
+    fs::rename(&old, &new).map_err(|e| e.to_string())?;
+
+    if old_path.ends_with(".md") {
+        let old_sidecar = page_sidecar_path(&old_path)?;
+        let new_sidecar = page_sidecar_path(&new_path)?;
+        if old_sidecar.exists() {
+            if let Some(parent) = new_sidecar.parent() {
+                fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            fs::rename(old_sidecar, new_sidecar).map_err(|e| e.to_string())?;
+        }
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn export_vault(file_path: String) -> Result<(), String> {
+    let root = ensure_vault_root()?;
+    let file = fs::File::create(&file_path).map_err(|e| e.to_string())?;
+    let mut zip = ZipWriter::new(file);
+    let options = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+    let mut has_entries = false;
+    for entry in WalkDir::new(&root).into_iter().filter_map(Result::ok) {
+        let path = entry.path();
+        if path == root {
+            continue;
+        }
+
+        let relative = path
+            .strip_prefix(&root)
+            .map_err(|e| e.to_string())?
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        if entry.file_type().is_dir() {
+            zip.add_directory(format!("{relative}/"), options)
+                .map_err(|e| e.to_string())?;
+        } else {
+            has_entries = true;
+            zip.start_file(relative, options).map_err(|e| e.to_string())?;
+            let mut source = fs::File::open(path).map_err(|e| e.to_string())?;
+            let mut buf = Vec::new();
+            source.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+            zip.write_all(&buf).map_err(|e| e.to_string())?;
+        }
+    }
+
+    if !has_entries {
+        zip.add_directory("vault/", options)
+            .map_err(|e| e.to_string())?;
+    }
+
+    zip.finish().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn import_vault(file_path: String) -> Result<(), String> {
+    let archive_file = fs::File::open(&file_path).map_err(|e| e.to_string())?;
+    let mut archive = ZipArchive::new(archive_file).map_err(|e| e.to_string())?;
+    let extraction_dir = tempdir().map_err(|e| e.to_string())?;
+
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
+        let enclosed = entry
+            .enclosed_name()
+            .ok_or_else(|| format!("Archive entry has invalid path: {}", entry.name()))?;
+        let out_path = extraction_dir.path().join(enclosed);
+
+        if entry.name().ends_with('/') {
+            fs::create_dir_all(&out_path).map_err(|e| e.to_string())?;
+            continue;
+        }
+
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+
+        let mut out_file = fs::File::create(&out_path).map_err(|e| e.to_string())?;
+        std::io::copy(&mut entry, &mut out_file).map_err(|e| e.to_string())?;
+    }
+
+    let extracted_root = fs::read_dir(extraction_dir.path())
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .find(|entry| entry.path().is_dir() || entry.path().is_file())
+        .map(|entry| entry.path());
+
+    let staged_root = extraction_dir.path().join("emerald_notes");
+    let import_root = match extracted_root {
+        Some(path) if path.file_name().and_then(|s| s.to_str()) == Some("emerald_notes") => path,
+        Some(_) => {
+            fs::create_dir_all(&staged_root).map_err(|e| e.to_string())?;
+            for entry in fs::read_dir(extraction_dir.path()).map_err(|e| e.to_string())? {
+                let entry = entry.map_err(|e| e.to_string())?;
+                let path = entry.path();
+                if path == staged_root {
+                    continue;
+                }
+                let target = staged_root.join(entry.file_name());
+                fs::rename(path, target).map_err(|e| e.to_string())?;
+            }
+            staged_root
+        }
+        None => staged_root,
+    };
+
+    let root = ensure_vault_root()?;
+    let backup_parent = tempdir().map_err(|e| e.to_string())?;
+    let backup_root = backup_parent.path().join("emerald_notes_backup");
+
+    if root.exists() {
+        fs::rename(&root, &backup_root).map_err(|e| e.to_string())?;
+    }
+
+    let restore_backup = |backup_root: &Path, root: &Path| -> Result<(), String> {
+        if backup_root.exists() && !root.exists() {
+            fs::rename(backup_root, root).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    };
+
+    match fs::rename(&import_root, &root) {
+        Ok(_) => {
+            if backup_root.exists() {
+                fs::remove_dir_all(&backup_root).map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        }
+        Err(err) => {
+            restore_backup(&backup_root, &root)?;
+            Err(err.to_string())
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -307,14 +578,19 @@ async fn get_media_info() -> Result<Option<MediaInfo>, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             save_note,
             read_note,
+            read_page_state,
+            save_page_state,
             get_directory_tree,
             create_folder,
             delete_item,
             rename_item,
+            export_vault,
+            import_vault,
             media_play_pause,
             media_next,
             media_previous,

@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "notes": [
+    {
+      "id": "mo0bfaiea3mh",
+      "title": "New Note",
+      "content": "",
+      "x": 342.0,
+      "y": 292.0,
+      "width": 260.0,
+      "height": 170.0,
+      "color": "#2ecc71",
+      "collapsed": false,
+      "imageUrl": null
+    }
+  ],
+  "connections": [],
+  "camera": {
+    "x": 0.0,
+    "y": 0.0,
+    "zoom": 1.0
+  }
+}

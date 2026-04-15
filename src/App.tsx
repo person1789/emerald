@@ -2,6 +2,7 @@ import React, {
   useState, useEffect, useRef, useCallback,
 } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { MediaMiniPlayer } from "./MediaMiniPlayer";
 import "./App.css";
 
@@ -41,7 +42,8 @@ interface FileNode {
 
 // ─── Stage 1: PageData & Tab types ───────────────────────────────────────────
 
-interface PageData {
+interface PageCanvasData {
+  version: number;
   notes: StickyNote[];
   connections: Connection[];
   camera: { x: number; y: number; zoom: number };
@@ -51,8 +53,9 @@ interface Tab {
   id: string;          // unique tab id (matches file path)
   path: string;        // relative path like "folder/page.md"
   title: string;       // display name (filename without .md)
-  data: PageData;
+  data: PageCanvasData;
   isDirty: boolean;
+  isSaving: boolean;
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -63,7 +66,8 @@ const NOTE_COLORS = [
 
 const COLLAPSED_H = 40;
 
-const defaultPageData = (): PageData => ({
+const defaultPageData = (): PageCanvasData => ({
+  version: 1,
   notes: [],
   connections: [],
   camera: { x: 0, y: 0, zoom: 1 },
@@ -561,6 +565,12 @@ export default function App() {
 
   const canvasRef = useRef<HTMLDivElement>(null);
   const imgInputRef = useRef<HTMLInputElement>(null);
+  const tabsRef = useRef<Tab[]>([]);
+  const saveTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+
+  useEffect(() => {
+    tabsRef.current = tabs;
+  }, [tabs]);
 
   const fetchTree = useCallback(async () => {
     try {
@@ -569,10 +579,77 @@ export default function App() {
     } catch (err) { console.error(err); }
   }, []);
 
+  const loadPageState = useCallback(async (path: string): Promise<PageCanvasData> => {
+    try {
+      return await invoke<PageCanvasData>("read_page_state", { path });
+    } catch (err) {
+      console.error(`Failed to load page state for ${path}`, err);
+      return defaultPageData();
+    }
+  }, []);
+
+  const persistTab = useCallback(async (tabId: string, snapshot: PageCanvasData) => {
+    setTabs((prev) => prev.map((tab) => (
+      tab.id === tabId ? { ...tab, isSaving: true } : tab
+    )));
+
+    try {
+      await invoke("save_page_state", { path: tabId, data: snapshot });
+      setTabs((prev) => prev.map((tab) => {
+        if (tab.id !== tabId) return tab;
+        if (tab.data !== snapshot) return { ...tab, isSaving: false };
+        return { ...tab, isDirty: false, isSaving: false };
+      }));
+    } catch (err) {
+      console.error(`Failed to save page state for ${tabId}`, err);
+      setTabs((prev) => prev.map((tab) => (
+        tab.id === tabId ? { ...tab, isSaving: false } : tab
+      )));
+    }
+  }, []);
+
+  const flushTabSave = useCallback((tabId: string) => {
+    const tab = tabsRef.current.find((entry) => entry.id === tabId);
+    if (!tab || !tab.isDirty) return;
+    void invoke("save_page_state", { path: tab.path, data: tab.data }).catch((err) => {
+      console.error(`Failed to flush page state for ${tab.path}`, err);
+    });
+  }, []);
+
+  const flushTabsForPath = useCallback((path: string) => {
+    tabsRef.current.forEach((tab) => {
+      const matches = tab.path === path || tab.path.startsWith(`${path}/`);
+      if (!matches) return;
+      flushTabSave(tab.id);
+      const timer = saveTimersRef.current.get(tab.id);
+      if (timer) {
+        clearTimeout(timer);
+        saveTimersRef.current.delete(tab.id);
+      }
+    });
+  }, [flushTabSave]);
+
   // ── Load directory tree ──────────────────────────────────────────────────
   useEffect(() => {
     fetchTree();
   }, [fetchTree]);
+
+  useEffect(() => {
+    tabs.forEach((tab) => {
+      if (!tab.isDirty || tab.isSaving || saveTimersRef.current.has(tab.id)) return;
+      const snapshot = tab.data;
+      const timer = setTimeout(() => {
+        saveTimersRef.current.delete(tab.id);
+        void persistTab(tab.id, snapshot);
+      }, 400);
+      saveTimersRef.current.set(tab.id, timer);
+    });
+  }, [tabs, persistTab]);
+
+  useEffect(() => () => {
+    saveTimersRef.current.forEach((timer) => clearTimeout(timer));
+    saveTimersRef.current.clear();
+  }, []);
 
   // Sync graph history with active tool context
   const getChildrenOfPath = useCallback((tNodes: FileNode[], parts: string[]): FileNode[] | null => {
@@ -632,13 +709,13 @@ export default function App() {
         setGraphHistory(prev => { const n = prev.slice(0, graphHistoryIdx + 1); n.push(""); return n; });
         setGraphHistoryIdx(prev => prev + 1);
       }
-    } else if (type === "page") {
-      if (id !== currentGraphContext) {
-        openOrSwitchTab(id, id.split('/').pop() || id);
-        setGraphHistory(prev => { const n = prev.slice(0, graphHistoryIdx + 1); n.push(id); return n; });
-        setGraphHistoryIdx(prev => prev + 1);
+      } else if (type === "page") {
+        if (id !== currentGraphContext) {
+        void openOrSwitchTab(id, id.split('/').pop() || id);
+          setGraphHistory(prev => { const n = prev.slice(0, graphHistoryIdx + 1); n.push(id); return n; });
+          setGraphHistoryIdx(prev => prev + 1);
+        }
       }
-    }
   };
 
   const handleItemDrop = async (sourcePath: string, targetDirPath: string) => {
@@ -649,6 +726,7 @@ export default function App() {
 
     const newPath = targetDirPath ? `${targetDirPath}/${sourceName}` : sourceName;
     try {
+      flushTabsForPath(sourcePath);
       await invoke("rename_item", { oldPath: sourcePath, newPath });
       await fetchTree();
 
@@ -680,6 +758,7 @@ export default function App() {
 
     const newPath = oldParts.length > 0 ? `${oldParts.join("/")}/${newName}` : newName;
     try {
+      flushTabsForPath(oldPath);
       await invoke("rename_item", { oldPath, newPath });
       await fetchTree();
 
@@ -705,6 +784,7 @@ export default function App() {
 
   const handleDeleteItem = async (path: string) => {
     try {
+      flushTabsForPath(path);
       await invoke("delete_item", { path });
       await fetchTree();
       setTabs((prev) => {
@@ -740,27 +820,29 @@ export default function App() {
     setTabs((prev) => prev.map((t) => {
       if (t.id !== activeTabId) return t;
       const next = typeof fn === "function" ? fn(t.data.camera) : fn;
-      return { ...t, data: { ...t.data, camera: next } };
+      return { ...t, isDirty: true, data: { ...t.data, camera: next } };
     }));
   }, [activeTabId]);
 
   // ── Stage 2: Open / switch tabs ──────────────────────────────────────────
   const openTabPaths = new Set(tabs.map((t) => t.path));
 
-  const openOrSwitchTab = useCallback((path: string, name: string) => {
+  const openOrSwitchTab = useCallback(async (path: string, name: string) => {
     const existing = tabs.find((t) => t.path === path);
     if (existing) {
       setActiveTabId(existing.id);
     } else {
       const title = name.replace(/\.md$/, "");
+      const data = await loadPageState(path);
       const newTab: Tab = {
         id: path,
         path,
         title,
-        data: defaultPageData(),
+        data,
         isDirty: false,
+        isSaving: false,
       };
-      setTabs((prev) => [...prev, newTab]);
+      setTabs((prev) => prev.some((tab) => tab.path === path) ? prev : [...prev, newTab]);
       setActiveTabId(path);
     }
     // Reset per-canvas UI on tab switch
@@ -772,7 +854,7 @@ export default function App() {
     setArrowTool(false);
     setShowCP(false);
     setEditLabel(null);
-  }, [tabs]);
+  }, [tabs, loadPageState]);
 
   const switchTab = useCallback((id: string) => {
     setActiveTabId(id);
@@ -788,6 +870,12 @@ export default function App() {
 
   const closeTab = useCallback((id: string, e: React.MouseEvent) => {
     e.stopPropagation();
+    flushTabSave(id);
+    const timer = saveTimersRef.current.get(id);
+    if (timer) {
+      clearTimeout(timer);
+      saveTimersRef.current.delete(id);
+    }
     setTabs((prev) => {
       const idx = prev.findIndex((t) => t.id === id);
       const next = prev.filter((t) => t.id !== id);
@@ -796,8 +884,8 @@ export default function App() {
         setActiveTabId(sibling?.id ?? null);
       }
       return next;
-    });
-  }, [activeTabId]);
+      });
+  }, [activeTabId, flushTabSave]);
 
   // ── Create a new page file ────────────────────────────────────────────────
   const createNewPage = async (folderPath?: string) => {
@@ -809,11 +897,51 @@ export default function App() {
       // Refresh tree
       const d = await invoke("get_directory_tree");
       setTree(d as FileNode[]);
-      openOrSwitchTab(path, filename);
+      await openOrSwitchTab(path, filename);
     } catch (err) {
       console.error(err);
     }
   };
+
+  const handleExportVault = useCallback(async () => {
+    try {
+      const filePath = await save({
+        title: "Export Emerald Vault",
+        defaultPath: "emerald-backup.emerald",
+        filters: [{ name: "Emerald Vault", extensions: ["emerald"] }],
+      });
+      if (!filePath) return;
+      await invoke("export_vault", { filePath });
+    } catch (err) {
+      console.error("Vault export failed", err);
+    }
+  }, []);
+
+  const handleImportVault = useCallback(async () => {
+    const confirmed = window.confirm("Importing a vault will replace the current Emerald binder. Continue?");
+    if (!confirmed) return;
+
+    try {
+      const filePath = await open({
+        title: "Import Emerald Vault",
+        multiple: false,
+        directory: false,
+        filters: [{ name: "Emerald Vault", extensions: ["emerald", "zip"] }],
+      });
+      if (!filePath || Array.isArray(filePath)) return;
+
+      await invoke("import_vault", { filePath });
+      saveTimersRef.current.forEach((timer) => clearTimeout(timer));
+      saveTimersRef.current.clear();
+      setTabs([]);
+      setActiveTabId(null);
+      setGraphHistory([""]);
+      setGraphHistoryIdx(0);
+      await fetchTree();
+    } catch (err) {
+      console.error("Vault import failed", err);
+    }
+  }, [fetchTree]);
 
   // ── Global keys ──────────────────────────────────────────────────────────
   useEffect(() => {
@@ -1024,6 +1152,12 @@ export default function App() {
           }} title="New folder">
             + Folder
           </button>
+          <button className="sidebar-btn" onClick={() => void handleExportVault()} title="Export full vault">
+            Export
+          </button>
+          <button className="sidebar-btn" onClick={() => void handleImportVault()} title="Import full vault">
+            Import
+          </button>
         </div>
 
         <div className="file-list">
@@ -1033,7 +1167,7 @@ export default function App() {
               activeTabPath={activeTab?.path ?? null}
               openTabPaths={openTabPaths}
               onOpenFile={(path, name) => {
-                openOrSwitchTab(path, name);
+                void openOrSwitchTab(path, name);
                 if (path !== currentGraphContext) {
                   setGraphHistory(prev => { const n = prev.slice(0, graphHistoryIdx + 1); n.push(path); return n; });
                   setGraphHistoryIdx(prev => prev + 1);
